@@ -77,7 +77,9 @@ Folders are valid open targets: `Info.plist` declares `public.folder` (rank `Non
 
 Five files must move together: `mac/project.yml` (`MARKETING_VERSION`), `mac/MDReader/Info.plist` (`CFBundleShortVersionString`), `mac/build-web/package.json` + `package-lock.json`, `win/src-tauri/Cargo.toml`, `win/src-tauri/tauri.conf.json`. After editing `Cargo.toml`, run `cargo update -p mdreader --offline` to sync `Cargo.lock`.
 
-**Release-bump rule:** when the user says any variant of "发提交 / 发布 / 发更新 / 发版", bump the patch version (1.0.0 → 1.0.1 → … → 1.0.11) across all five files in the same change, then **ask the user to confirm the new version before committing**. Default to patch-level bumps; only bump minor/major if the user explicitly says so.
+**Release-bump rule:** when the user says any variant of "发提交 / 发布 / 发更新 / 发版", bump the patch version (1.0.0 → 1.0.1 → … → 1.0.11) across all five files in the same change, then **ask the user to confirm the new version before committing**. Default to patch-level bumps; only bump minor/major if the user explicitly says so. (Exception: if the current version hasn't shipped yet, don't bump — release as-is.)
+
+**Post-release artifact archive:** after the release push, watch the GitHub Actions runs for that commit (`gh run watch` or `gh run list`). When all artifacts complete, download them into `release/v<version>/` (e.g. `release/v1.0.0/`) and `git add` + commit them as a follow-up. Naming: keep CI artifact filenames as-is (`MDGEM-arm64.dmg`, `MDGEM-intel.dmg`, `MDGEM_<version>_x64-setup.exe`). The `release/` directory is intentionally **not** gitignored — it's the version-pinned binary archive.
 
 ## CI
 
