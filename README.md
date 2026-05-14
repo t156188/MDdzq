@@ -24,21 +24,23 @@ MDdzq/
 │   │   ├── tauri.conf.json           # frontendDist → ../../mac/Resources
 │   │   ├── capabilities/default.json
 │   │   ├── Cargo.toml / Cargo.lock
-│   │   └── icons/                    # 从 dzq050232.jpg 生成
+│   │   └── icons/                    # icon.ico 嵌进 .exe；icon.png 给 NSIS / 运行时
 │   └── README.md
-├── dzq050232.jpg                     # 原图（1080×1620）
-├── icon-source.png                   # 居中裁切后 1080×1080，两端 icon 都从这生成
 └── .github/workflows/windows-build.yml
 ```
 
 ## App icon
 
-两端用同一张图：`dzq050232.jpg` →（中心裁正方形）`icon-source.png`。
+两端共用一张方图作为源（不再常驻仓库；要换图时临时放到根目录 `icon-source.png` 后跑下面的脚本，跑完即可删）。
 
-- Mac：`mac/MDReader/AppIcon.icns`（含 16/32/128/256/512 + @2x，由 `iconutil` 打包）
-- Win：`win/src-tauri/icons/{32,128,256,512}x*.png` + `icon.{png,ico}`（RGBA）
+- Mac：
+  - `mac/MDReader/Assets.xcassets/AppIcon.appiconset/*.png`（**真正生效**，asset catalog 编译进 `Assets.car`，`Info.plist` 的 `CFBundleIconName` 指向它）
+  - `mac/MDReader/AppIcon.icns`（fallback，`CFBundleIconFile` 指向，现代 macOS 一般用不到，保留无害）
+- Win：
+  - `win/src-tauri/icons/icon.ico`（多分辨率 16/32/48/64/128/256，嵌进 `.exe`，Explorer / 任务栏显示）
+  - `win/src-tauri/icons/icon.png` + `{32,128,256,512}x*.png`（NSIS 安装器 / 运行时 fallback）
 
-替换图标：换 `dzq050232.jpg` 后参考下面"重新生成 icon"一节。
+`tauri.conf.json` 的 `bundle.icon` 列表只列了 `icon.png` 和 `icon.ico` —— 其它尺寸 PNG 是历史产物，删了也不影响 Win 构建。
 
 ## 各端开发
 
@@ -78,20 +80,38 @@ cargo run -- ../../mac/Samples/test-sample.md
 
 ## 重新生成 icon（换图时）
 
+把新图丢到根目录，然后：
+
 ```sh
-# 1. 重做正方形源图
-sips --setProperty format png --cropToHeightWidth $S $S dzq050232.jpg --out icon-source.png  # $S = min(w,h)
+# 0. 把新图裁成正方形 icon-source.png（1080×1080）。
+#    简单居中裁：
+sips --setProperty format png --cropToHeightWidth $S $S <新图>.jpg --out icon-source.png  # $S = min(w,h)
+#    若主体偏上/偏下，居中裁会切掉头/脚 —— 用 Swift 一行做带偏移裁切（见 git log 找 Claude 之前那段脚本，或直接喂给 Claude 让它处理）
 
-# 2. Win 端：可直接用 tauri-cli 一键
-cd win/src-tauri && cargo tauri icon ../../icon-source.png
-
-# 3. Mac 端：生成 .iconset 后用 iconutil
+# 1. Mac：刷 asset catalog（真正生效的那份）+ .icns（fallback）
+APPSET=mac/MDReader/Assets.xcassets/AppIcon.appiconset
 ICONSET=mac/MDReader/AppIcon.iconset
 mkdir -p $ICONSET
 for s in 16 32 128 256 512; do
-  sips -z $s $s   icon-source.png --out $ICONSET/icon_${s}x${s}.png
-  sips -z $((s*2)) $((s*2)) icon-source.png --out $ICONSET/icon_${s}x${s}@2x.png
+  sips -z $s $s   icon-source.png --out $APPSET/icon_${s}x${s}.png
+  sips -z $((s*2)) $((s*2)) icon-source.png --out $APPSET/icon_${s}x${s}@2x.png
+  cp $APPSET/icon_${s}x${s}.png    $ICONSET/icon_${s}x${s}.png
+  cp $APPSET/icon_${s}x${s}@2x.png $ICONSET/icon_${s}x${s}@2x.png
 done
 iconutil --convert icns $ICONSET --output mac/MDReader/AppIcon.icns
 rm -rf $ICONSET
+
+# 2. Win：尺寸 PNG + 多分辨率 ICO
+DEST=win/src-tauri/icons
+for s in 32 128 256 512; do
+  sips -z $s $s icon-source.png --out $DEST/${s}x${s}.png
+done
+sips -z 512 512 icon-source.png --out $DEST/icon.png
+python3 -c "from PIL import Image; \
+Image.open('icon-source.png').convert('RGBA').save('$DEST/icon.ico', \
+format='ICO', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+# 没装 Pillow：pip install Pillow；或在 Win 机器上用 cargo tauri icon
+
+# 3. 清掉根目录临时图
+rm icon-source.png <新图>.jpg
 ```
