@@ -46,32 +46,6 @@
     }, true);
   }
 
-  function installEmptyState() {
-    var root = document.getElementById('root');
-    if (!root) return;
-    if (document.getElementById('mdreader-empty')) return;
-    var hint = document.createElement('div');
-    hint.id = 'mdreader-empty';
-    hint.style.cssText =
-      'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;' +
-      'pointer-events:none;color:var(--muted);font:14px/1.6 -apple-system,Segoe UI,sans-serif;' +
-      'text-align:center;padding:48px;opacity:0.7;';
-    hint.innerHTML =
-      '<div>' +
-      '<div style="font-size:48px;margin-bottom:12px;">📄</div>' +
-      '<div>Drop a <code>.md</code> file here<br/>' +
-      'or press <kbd>Ctrl</kbd>+<kbd>O</kbd> to open one</div>' +
-      '</div>';
-    document.body.appendChild(hint);
-    var obs = new MutationObserver(function () {
-      if (root.children.length > 0) {
-        hint.remove();
-        obs.disconnect();
-      }
-    });
-    obs.observe(root, { childList: true });
-  }
-
   function wrapRender() {
     // Wait until viewer.bundle.js sets window.MDViewerAPI, then wrap render() so
     // we can post-process images on each render.
@@ -113,6 +87,12 @@
         window.MDViewerAPI.setTheme(p.name || 'light');
       }
     });
+    t.event.listen('mdreader:file-tree', function (e) {
+      var p = (e && e.payload) || null;
+      if (p && window.MDViewerAPI && typeof window.MDViewerAPI.setFileTree === 'function') {
+        window.MDViewerAPI.setFileTree(p);
+      }
+    });
     if (cb) cb();
     return true;
   }
@@ -126,7 +106,6 @@
 
   function boot() {
     installLinkInterceptor();
-    installEmptyState();
     wrapRender();
     var tries = 0;
     (function tryListen() {

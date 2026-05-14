@@ -23,6 +23,7 @@
     },
     "opener:default",
     "opener:allow-open-url",
-    "store:default"
+    "store:default",
+    "window-state:default"
   ]
 }

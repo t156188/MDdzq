@@ -4,14 +4,18 @@ import UniformTypeIdentifiers
 @main
 struct MDReaderApp: App {
     @AppStorage("themeOverride") private var themeOverride: String = "system"
+    @AppStorage("pageZoom") private var pageZoom: Double = 1.0
 
     var body: some Scene {
         DocumentGroup(viewing: MarkdownDocument.self) { file in
             ContentView(document: file.document, fileURL: file.fileURL)
-                .frame(minWidth: 520, minHeight: 360)
+                .frame(minWidth: 520, idealWidth: 900, minHeight: 360, idealHeight: 720)
                 .preferredColorScheme(colorScheme(for: themeOverride))
         }
-        .commands { MDReaderCommands(themeOverride: $themeOverride) }
+        .defaultSize(width: 900, height: 720)
+        .commands {
+            MDReaderCommands(themeOverride: $themeOverride, pageZoom: $pageZoom)
+        }
     }
 
     private func colorScheme(for value: String) -> ColorScheme? {

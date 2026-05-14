@@ -4,10 +4,35 @@
 
 轻量 Markdown 阅读器，双端：
 
-- **`mac/`** — macOS 原生壳（SwiftUI + WKWebView），Apple Silicon。
+- **`mac/`** — macOS 原生壳（SwiftUI + WKWebView），Apple Silicon / Intel。
 - **`win/`** — Windows 原生壳（Tauri 2 / Rust + WebView2）。
 
-两端共享 `mac/Resources/` 下的前端渲染层（markdown-it + highlight.js + KaTeX + Mermaid），UI 完全一致。
+两端共享 `mac/Resources/` 下的前端渲染层 + 侧栏 UI（markdown-it + highlight.js + KaTeX + Mermaid），逐像素一致。
+
+## 功能
+
+- 双击 `.md` 即开，关联五个后缀：`md / markdown / mdown / mkd / mkdn`
+- 渲染：GFM 表格 / 任务列表 / 代码高亮 / Mermaid / KaTeX
+- 主题：Follow System / Light / Dark，持久化；两个入口
+  - 菜单 View → Appearance
+  - 侧栏底栏 `◧` hover 浮菜单
+- 缩放：`⌘=` / `⌘-` / `⌘0`（Win 是 `Ctrl`）
+- 侧栏：`⌘B` 折叠 / 展开（Win `Ctrl+B`）
+  - **Files tab** — 工作区根目录递归列所有 `.md`，文件夹优先、自然排序、空目录剪掉
+  - **Outline tab** — 当前文档 H1–H6 跳转
+  - 拖右边缘改宽度，宽度 + 当前 tab + 折叠状态写 localStorage
+- 工作区固定：初次打开的那个 `.md` 父目录就是 workspace，后续在侧栏里点别的 .md 不会改变 workspace
+- 右键文件树
+  - 文件：Open / Reveal in Finder（Win 是 Explorer）/ Copy Path / Rename… / Move to Trash（Win 是 Recycle Bin）
+  - 文件夹：Reveal / Copy Path
+  - Rename / Delete 都走系统废纸篓，删当前打开的文件会被拒
+- `⌘A` / `Ctrl+A` 只选右侧文档内容，不会把侧栏目录一起选进去
+- 外链走系统默认浏览器
+- 彩蛋 `❀` — 遇事不决问春风~（侧栏底栏，hover 弹菜单）
+  - 抛硬币（3D 翻转 + 弧线 + 落地阴影）— 正反各 18 条文案
+  - 摇骰子（真 CSS 立方体六面带点，三轴翻滚 + 跳跃 + 落地挤压）— 每面 18 条文案
+  - 抽签（竹签筒摇晃 + 选中签升起）— 上上 / 上 / 中 / 下 / 下下，加权偏中间，每签 18 条文案
+  - 春风一句（花瓣随风漂过 + 句子浮上）— 108 条签语（分八组：决断 / 缓行 / 宜忌 / 自处 / 行动 / 时机 / 生活 / 放下）
 
 ## 仓库结构
 

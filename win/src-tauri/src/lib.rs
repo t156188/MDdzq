@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{
     AppHandle, DragDropEvent, Emitter, Listener, Manager, WebviewUrl, WebviewWindow,
@@ -18,7 +18,12 @@ const STORE_KEY_THEME: &str = "themeOverride"; // "system" | "light" | "dark"
 
 #[derive(Default)]
 struct OpenState {
+    /// Currently displayed .md file.
     current_file: Mutex<Option<PathBuf>>,
+    /// Pinned at the first opened file's parent directory. Sidebar clicks do
+    /// not change this — only "new document" entry points (initial argv,
+    /// drag-drop, File → Open, single-instance forward).
+    workspace_root: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -30,6 +35,39 @@ struct RenderPayload {
 #[derive(Serialize, Clone)]
 struct ThemePayload {
     name: String,
+    pref: String,
+}
+
+#[derive(Serialize, Clone)]
+struct FileTreeNode {
+    #[serde(rename = "type")]
+    kind: String,
+    name: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    children: Option<Vec<FileTreeNode>>,
+}
+
+#[derive(Serialize, Clone)]
+struct FileTreePayload {
+    root: FileTreeNode,
+    current: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FsOp {
+    op: String,
+    path: String,
+    #[serde(default, rename = "newName")]
+    new_name: Option<String>,
+}
+
+#[derive(Copy, Clone)]
+enum LoadMode {
+    /// New document entry point — reset workspace_root to the file's parent.
+    NewWorkspace,
+    /// Sidebar click inside the existing workspace — keep workspace_root.
+    KeepWorkspace,
 }
 
 fn is_markdown_path(p: &Path) -> bool {
@@ -109,9 +147,10 @@ fn effective_theme_name(app: &AppHandle, window: &WebviewWindow) -> &'static str
     }
 }
 
-fn push_theme(window: &WebviewWindow, name: &str) {
+fn push_theme(window: &WebviewWindow, name: &str, pref: &str) {
     let payload = ThemePayload {
         name: name.to_string(),
+        pref: pref.to_string(),
     };
     let _ = window.emit("mdreader:theme", payload);
     let theme = if name == "dark" {
@@ -120,6 +159,100 @@ fn push_theme(window: &WebviewWindow, name: &str) {
         Some(tauri::Theme::Light)
     };
     let _ = window.set_theme(theme);
+}
+
+fn display_name(p: &Path) -> String {
+    p.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| p.to_string_lossy().to_string())
+}
+
+fn scan_tree(url: &Path, is_root: bool) -> Option<FileTreeNode> {
+    let metadata = std::fs::metadata(url).ok()?;
+    if metadata.is_dir() {
+        let entries = std::fs::read_dir(url).ok()?;
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(|r| r.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| !s.starts_with('.'))
+                    .unwrap_or(false)
+            })
+            .collect();
+        // Folders first (alpha), then files (alpha). Mirrors the typical
+        // file-tree UI (Explorer, VS Code Explorer, etc.).
+        paths.sort_by(|a, b| {
+            let a_dir = a.is_dir();
+            let b_dir = b.is_dir();
+            if a_dir != b_dir {
+                return if a_dir {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
+            a.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase()
+                .cmp(
+                    &b.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase(),
+                )
+        });
+        let mut children = Vec::new();
+        for p in paths {
+            if let Some(n) = scan_tree(&p, false) {
+                children.push(n);
+            }
+        }
+        if !is_root && children.is_empty() {
+            return None;
+        }
+        Some(FileTreeNode {
+            kind: "dir".to_string(),
+            name: display_name(url),
+            path: url.to_string_lossy().to_string(),
+            children: Some(children),
+        })
+    } else {
+        if !is_markdown_path(url) {
+            return None;
+        }
+        Some(FileTreeNode {
+            kind: "file".to_string(),
+            name: display_name(url),
+            path: url.to_string_lossy().to_string(),
+            children: None,
+        })
+    }
+}
+
+fn push_file_tree(window: &WebviewWindow, workspace_root: &Path, current: Option<&Path>) {
+    let Some(root) = scan_tree(workspace_root, true) else {
+        return;
+    };
+    let payload = FileTreePayload {
+        root,
+        current: current.map(|p| p.to_string_lossy().to_string()),
+    };
+    let _ = window.emit("mdreader:file-tree", payload);
+}
+
+fn refresh_tree(app: &AppHandle) {
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
+    let state = app.state::<OpenState>();
+    let root = state.workspace_root.lock().unwrap().clone();
+    let current = state.current_file.lock().unwrap().clone();
+    if let Some(root) = root {
+        push_file_tree(&w, &root, current.as_deref());
+    }
 }
 
 fn push_render(window: &WebviewWindow, path: &Path) -> Result<(), String> {
@@ -147,7 +280,7 @@ fn push_render(window: &WebviewWindow, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn open_file_into_window(window: &WebviewWindow, path: PathBuf) {
+fn load_file(window: &WebviewWindow, path: PathBuf, mode: LoadMode) {
     let app = window.app_handle().clone();
     if let Err(err) = push_render(window, &path) {
         let _ = app
@@ -159,7 +292,15 @@ fn open_file_into_window(window: &WebviewWindow, path: PathBuf) {
         return;
     }
     let state = app.state::<OpenState>();
-    *state.current_file.lock().unwrap() = Some(path);
+    *state.current_file.lock().unwrap() = Some(path.clone());
+    if matches!(mode, LoadMode::NewWorkspace) {
+        let new_root = path.parent().map(|p| p.to_path_buf());
+        *state.workspace_root.lock().unwrap() = new_root;
+    }
+    let root = state.workspace_root.lock().unwrap().clone();
+    if let Some(root) = root {
+        push_file_tree(window, &root, Some(&path));
+    }
 }
 
 fn open_file_dialog(window: WebviewWindow) {
@@ -178,9 +319,115 @@ fn open_file_dialog(window: WebviewWindow) {
             };
             let w = window.clone();
             window
-                .run_on_main_thread(move || open_file_into_window(&w, path))
+                .run_on_main_thread(move || load_file(&w, path, LoadMode::NewWorkspace))
                 .ok();
         });
+}
+
+fn toast(window: &WebviewWindow, message: &str, kind: &str) {
+    let m = serde_json::to_string(message).unwrap_or_else(|_| "\"\"".to_string());
+    let k = serde_json::to_string(kind).unwrap_or_else(|_| "\"info\"".to_string());
+    let _ = window.eval(&format!(
+        "window.MDViewerAPI && window.MDViewerAPI.toast && window.MDViewerAPI.toast({m}, {k});"
+    ));
+}
+
+fn reveal_in_explorer(path: &Path) {
+    let p = path.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{}", p))
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Useful when developers run `cargo run` on a Mac to smoke-test logic.
+        let _ = std::process::Command::new("open").arg("-R").arg(&p).spawn();
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        if let Some(dir) = path.parent() {
+            let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        }
+    }
+}
+
+fn handle_fs_op(app: &AppHandle, op: FsOp) {
+    let Some(w) = app.get_webview_window("main") else {
+        return;
+    };
+    let path = PathBuf::from(&op.path);
+    match op.op.as_str() {
+        "reveal" => {
+            reveal_in_explorer(&path);
+        }
+        "copyPath" => {
+            // JS already tried navigator.clipboard.writeText and asked us to
+            // do it via the platform clipboard.
+            let json = serde_json::to_string(&op.path).unwrap_or_default();
+            let _ = w.eval(&format!(
+                "navigator.clipboard.writeText({json}).then(()=>window.MDViewerAPI.toast('Path copied','info'),()=>window.MDViewerAPI.toast('Could not copy','error'));"
+            ));
+        }
+        "rename" => {
+            let Some(new_name) = op.new_name.filter(|s| !s.trim().is_empty()) else {
+                toast(&w, "Invalid name", "error");
+                return;
+            };
+            if new_name.contains('/') || new_name.contains('\\') {
+                toast(&w, "Name cannot contain / or \\", "error");
+                return;
+            }
+            let parent = path.parent().unwrap_or_else(|| Path::new(""));
+            let dst = parent.join(&new_name);
+            if dst.exists() {
+                toast(&w, "A file with that name already exists", "error");
+                return;
+            }
+            match std::fs::rename(&path, &dst) {
+                Ok(_) => {
+                    let state = app.state::<OpenState>();
+                    let was_current = {
+                        let mut cur = state.current_file.lock().unwrap();
+                        if cur.as_deref() == Some(path.as_path()) {
+                            *cur = Some(dst.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if was_current {
+                        let title = dst
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| format!("{s} — MDGEM"))
+                            .unwrap_or_else(|| "MDGEM".to_string());
+                        let _ = w.set_title(&title);
+                    }
+                    refresh_tree(app);
+                    toast(&w, "Renamed", "info");
+                }
+                Err(e) => toast(&w, &format!("Rename failed: {e}"), "error"),
+            }
+        }
+        "delete" => {
+            let state = app.state::<OpenState>();
+            let is_current = state.current_file.lock().unwrap().as_deref() == Some(path.as_path());
+            if is_current {
+                toast(&w, "Close the file before deleting it", "error");
+                return;
+            }
+            match trash::delete(&path) {
+                Ok(_) => {
+                    refresh_tree(app);
+                    toast(&w, "Moved to Recycle Bin", "info");
+                }
+                Err(e) => toast(&w, &format!("Delete failed: {e}"), "error"),
+            }
+        }
+        _ => {}
+    }
 }
 
 fn rebuild_menu(app: &AppHandle) -> tauri::Result<()> {
@@ -235,7 +482,13 @@ fn rebuild_menu(app: &AppHandle) -> tauri::Result<()> {
         .accelerator("CmdOrCtrl+0")
         .build(app)?;
 
+    let toggle_sidebar = MenuItemBuilder::with_id("toggleSidebar", "Toggle Sidebar")
+        .accelerator("CmdOrCtrl+B")
+        .build(app)?;
+
     let view_menu = SubmenuBuilder::new(app, "View")
+        .item(&toggle_sidebar)
+        .separator()
         .item(&appearance)
         .separator()
         .item(&zoom_in)
@@ -273,7 +526,9 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         }
         "selectAll" => {
             if let Some(w) = window {
-                let _ = w.eval("document.execCommand('selectAll')");
+                let _ = w.eval(
+                    "window.MDViewerAPI && window.MDViewerAPI.selectAllContent ? window.MDViewerAPI.selectAllContent() : document.execCommand('selectAll')",
+                );
             }
         }
         "zoomIn" | "zoomOut" | "zoomReset" => {
@@ -286,12 +541,19 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
                 let _ = w.eval(js);
             }
         }
+        "toggleSidebar" => {
+            if let Some(w) = window {
+                let _ = w.eval(
+                    "window.MDViewerAPI && window.MDViewerAPI.toggleSidebar && window.MDViewerAPI.toggleSidebar();",
+                );
+            }
+        }
         "theme:system" | "theme:light" | "theme:dark" => {
             let value = &id["theme:".len()..];
             write_theme_pref(app, value);
             if let Some(w) = app.get_webview_window("main") {
                 let name = effective_theme_name(app, &w);
-                push_theme(&w, name);
+                push_theme(&w, name, value);
             }
             let _ = rebuild_menu(app);
         }
@@ -310,7 +572,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 fn handle_drop(app: &AppHandle, paths: Vec<PathBuf>) {
     if let Some(p) = paths.into_iter().find(|p| is_markdown_path(p)) {
         if let Some(w) = app.get_webview_window("main") {
-            open_file_into_window(&w, p);
+            load_file(&w, p, LoadMode::NewWorkspace);
         }
     }
 }
@@ -328,11 +590,12 @@ pub fn run() {
                 let _ = w.unminimize();
                 let _ = w.set_focus();
                 if let Some(p) = pick_md_from_args(argv) {
-                    open_file_into_window(&w, p);
+                    load_file(&w, p, LoadMode::NewWorkspace);
                 }
             }
         }))
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
@@ -351,7 +614,8 @@ pub fn run() {
             // Queue any argv file before window opens; JS will pull it once ready.
             if let Some(p) = initial_file.clone() {
                 let state = handle.state::<OpenState>();
-                *state.current_file.lock().unwrap() = Some(p);
+                *state.current_file.lock().unwrap() = Some(p.clone());
+                *state.workspace_root.lock().unwrap() = p.parent().map(|x| x.to_path_buf());
             }
 
             let _window = WebviewWindowBuilder::new(
@@ -366,16 +630,21 @@ pub fn run() {
             .initialization_script(BRIDGE_JS)
             .build()?;
 
-            // JS bridge tells us when it's ready; we then push theme + pending file.
+            // JS bridge tells us when it's ready; push theme + pending file + tree.
             let h_ready = handle.clone();
             handle.listen_any("mdreader:ready", move |_event| {
                 if let Some(w) = h_ready.get_webview_window("main") {
+                    let pref = read_theme_pref(&h_ready);
                     let name = effective_theme_name(&h_ready, &w);
-                    push_theme(&w, name);
+                    push_theme(&w, name, &pref);
                     let state = h_ready.state::<OpenState>();
                     let pending = state.current_file.lock().unwrap().clone();
-                    if let Some(p) = pending {
-                        let _ = push_render(&w, &p);
+                    let root = state.workspace_root.lock().unwrap().clone();
+                    if let Some(p) = pending.as_ref() {
+                        let _ = push_render(&w, p);
+                    }
+                    if let Some(root) = root {
+                        push_file_tree(&w, &root, pending.as_deref());
                     }
                 }
             });
@@ -388,6 +657,47 @@ pub fn run() {
                 if !raw.is_empty() {
                     let _ = h_link.opener().open_url(raw, None::<&str>);
                 }
+            });
+
+            // Sidebar file-click forwarder: open inside the existing workspace.
+            let h_open = handle.clone();
+            handle.listen_any("mdreader:open-file", move |event| {
+                let raw: String =
+                    serde_json::from_str(event.payload()).unwrap_or_default();
+                if raw.is_empty() {
+                    return;
+                }
+                if let Some(w) = h_open.get_webview_window("main") {
+                    load_file(&w, PathBuf::from(raw), LoadMode::KeepWorkspace);
+                }
+            });
+
+            // File-system ops from the sidebar context menu.
+            let h_op = handle.clone();
+            handle.listen_any("mdreader:fs-op", move |event| {
+                let op: FsOp = match serde_json::from_str(event.payload()) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                handle_fs_op(&h_op, op);
+            });
+
+            // Sidebar theme toggle: JS pushes the user's preference, we
+            // persist it, re-resolve effective theme, push back, and
+            // rebuild the menu so the checkmark stays in sync.
+            let h_theme = handle.clone();
+            handle.listen_any("mdreader:set-theme-pref", move |event| {
+                let pref: String =
+                    serde_json::from_str(event.payload()).unwrap_or_default();
+                if pref != "system" && pref != "light" && pref != "dark" {
+                    return;
+                }
+                write_theme_pref(&h_theme, &pref);
+                if let Some(w) = h_theme.get_webview_window("main") {
+                    let name = effective_theme_name(&h_theme, &w);
+                    push_theme(&w, name, &pref);
+                }
+                let _ = rebuild_menu(&h_theme);
             });
 
             Ok(())

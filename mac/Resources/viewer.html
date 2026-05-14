@@ -9,7 +9,62 @@
     <link rel="stylesheet" href="viewer.css" />
   </head>
   <body>
-    <main id="root" class="markdown-body"></main>
+    <aside id="sidebar" data-tab="files">
+      <div class="sb-tabs" role="tablist">
+        <button class="sb-tab" data-tab="files" role="tab" aria-selected="true">Files</button>
+        <button class="sb-tab" data-tab="outline" role="tab" aria-selected="false">Outline</button>
+        <button class="sb-collapse" id="sb-collapse" title="Collapse sidebar" aria-label="Collapse sidebar">‹</button>
+      </div>
+      <div class="sb-pane" id="sb-pane-files"></div>
+      <div class="sb-pane" id="sb-pane-outline" hidden></div>
+      <footer class="sb-footer">
+        <div class="sb-theme-wrap">
+          <button id="sb-theme-btn" class="sb-theme-btn" type="button" aria-label="Appearance">
+            <span class="sb-theme-icon" aria-hidden="true">◧</span>
+          </button>
+          <div class="sb-theme-menu" id="sb-theme-menu" role="menu">
+            <div class="sb-theme-item" data-pref="system" role="menuitem">
+              <span class="sb-theme-mi" aria-hidden="true">◐</span><span>Auto</span>
+            </div>
+            <div class="sb-theme-item" data-pref="light" role="menuitem">
+              <span class="sb-theme-mi" aria-hidden="true">☼</span><span>Light</span>
+            </div>
+            <div class="sb-theme-item" data-pref="dark" role="menuitem">
+              <span class="sb-theme-mi" aria-hidden="true">☾</span><span>Dark</span>
+            </div>
+          </div>
+        </div>
+        <div class="sb-fortune-wrap">
+          <button id="sb-fortune-btn" class="sb-fortune-btn" type="button" title="遇事不决问春风~" aria-label="遇事不决问春风">
+            <span aria-hidden="true">❀</span>
+          </button>
+          <div class="sb-fortune-menu" id="sb-fortune-menu" role="menu">
+            <div class="sb-fortune-title">遇事不决问春风~</div>
+            <div class="sb-fortune-item" data-kind="coin" role="menuitem">
+              <span class="sb-fm-icon" aria-hidden="true">¢</span><span>抛硬币</span>
+            </div>
+            <div class="sb-fortune-item" data-kind="dice" role="menuitem">
+              <span class="sb-fm-icon" aria-hidden="true">⚄</span><span>摇骰子</span>
+            </div>
+            <div class="sb-fortune-item" data-kind="lots" role="menuitem">
+              <span class="sb-fm-icon" aria-hidden="true">⌬</span><span>抽签</span>
+            </div>
+            <div class="sb-fortune-item" data-kind="saying" role="menuitem">
+              <span class="sb-fm-icon" aria-hidden="true">✦</span><span>春风一句</span>
+            </div>
+          </div>
+        </div>
+      </footer>
+      <div class="sb-resize" id="sb-resize" aria-hidden="true"></div>
+    </aside>
+    <button id="sb-expand" class="sb-expand" hidden title="Show sidebar" aria-label="Show sidebar">›</button>
+    <main id="main">
+      <div id="root" class="markdown-body"></div>
+      <div id="empty-state" class="empty-state" hidden>
+        <div class="empty-glyph">.md</div>
+        <div class="empty-text">Open a Markdown file to begin</div>
+      </div>
+    </main>
     <script src="vendor/viewer.bundle.js"></script>
     <script>
       // Swap highlight.js theme when the page theme flips.
