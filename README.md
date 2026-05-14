@@ -1,5 +1,7 @@
 # MDdzq
 
+**App 显示名**：**MDGEM** — **M**ark**D**own · a tiny **gem** for reading `.md` files. 一颗用来阅读 Markdown 的小宝石。
+
 轻量 Markdown 阅读器，双端：
 
 - **`mac/`** — macOS 原生壳（SwiftUI + WKWebView），Apple Silicon。
@@ -49,7 +51,7 @@ MDdzq/
 ```sh
 cd mac
 brew install xcodegen          # 仅首次
-make build                     # 构建 Release，产物在 build/.../MDReader.app
+make build                     # 构建 Release，产物在 build/.../MDGEM.app
 make open-sample               # 打开样例文档
 ```
 
@@ -68,8 +70,8 @@ cargo run -- ../../mac/Samples/test-sample.md
 
 | Workflow | 触发条件 | 产物 |
 |---|---|---|
-| `windows-build.yml` | 推 `win/**` 或 `mac/Resources/**`，或手动 | `MDReader-Setup-0.1.0.exe`（NSIS x64）|
-| `macos-build.yml` | 推 `mac/**`，或手动 | `MDReader-arm64.dmg`（Apple Silicon）+ `MDReader-intel.dmg`（Intel） |
+| `windows-build.yml` | 推 `win/**` 或 `mac/Resources/**`，或手动 | `MDGEM_0.1.0_x64-setup.exe`（NSIS x64）|
+| `macos-build.yml` | 推 `mac/**`，或手动 | `MDGEM-arm64.dmg`（Apple Silicon）+ `MDGEM-intel.dmg`（Intel） |
 
 去 Actions 页面对应那次运行的 **Artifacts** 区下载。Mac 两个芯片版本用 matrix build 并行，约 8–12 分钟跑完。
 

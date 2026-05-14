@@ -58,19 +58,19 @@ jobs:
       - name: Package as DMG
         working-directory: mac
         run: |
-          APP="build/Build/Products/Release/MDReader.app"
-          DMG="../MDReader-${{ matrix.suffix }}.dmg"
+          APP="build/Build/Products/Release/MDGEM.app"
+          DMG="../MDGEM-${{ matrix.suffix }}.dmg"
           # Stage in a temp folder so the DMG window has a /Applications shortcut.
           STAGE="$(mktemp -d)/dmg"
           mkdir -p "$STAGE"
           cp -R "$APP" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "MDReader" -srcfolder "$STAGE" \
+          hdiutil create -volname "MDGEM" -srcfolder "$STAGE" \
             -ov -format UDZO "$DMG"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MDReader-macOS-${{ matrix.suffix }}
+          name: MDGEM-macOS-${{ matrix.suffix }}
           path: |
-            MDReader-${{ matrix.suffix }}.dmg
-            mac/build/Build/Products/Release/MDReader.app
+            MDGEM-${{ matrix.suffix }}.dmg
+            mac/build/Build/Products/Release/MDGEM.app

@@ -141,8 +141,8 @@ fn push_render(window: &WebviewWindow, path: &Path) -> Result<(), String> {
     let title = path
         .file_name()
         .and_then(|s| s.to_str())
-        .map(|s| format!("{s} — MDReader"))
-        .unwrap_or_else(|| "MDReader".to_string());
+        .map(|s| format!("{s} — MDGEM"))
+        .unwrap_or_else(|| "MDGEM".to_string());
     let _ = window.set_title(&title);
     Ok(())
 }
@@ -154,7 +154,7 @@ fn open_file_into_window(window: &WebviewWindow, path: PathBuf) {
             .dialog()
             .message(format!("Could not open file:\n{}\n\n{err}", path.display()))
             .kind(tauri_plugin_dialog::MessageDialogKind::Error)
-            .title("MDReader")
+            .title("MDGEM")
             .blocking_show();
         return;
     }
@@ -190,7 +190,7 @@ fn rebuild_menu(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItemBuilder::with_id("open", "Open…")
         .accelerator("CmdOrCtrl+O")
         .build(app)?;
-    let quit = MenuItemBuilder::with_id("quit", "Quit MDReader")
+    let quit = MenuItemBuilder::with_id("quit", "Quit MDGEM")
         .accelerator("CmdOrCtrl+Q")
         .build(app)?;
     let file_menu = SubmenuBuilder::new(app, "File")
@@ -243,7 +243,7 @@ fn rebuild_menu(app: &AppHandle) -> tauri::Result<()> {
         .item(&zoom_reset)
         .build()?;
 
-    let about = MenuItemBuilder::with_id("about", "About MDReader").build(app)?;
+    let about = MenuItemBuilder::with_id("about", "About MDGEM").build(app)?;
     let help_menu = SubmenuBuilder::new(app, "Help").item(&about).build()?;
 
     let menu = MenuBuilder::new(app)
@@ -298,8 +298,8 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         "about" => {
             let _ = app
                 .dialog()
-                .message("MDReader 0.1.0\nLightweight Markdown reader\n\nCopyright © 2026")
-                .title("About MDReader")
+                .message("MDGEM 0.1.0\nMarkdown — a tiny gem for reading .md files.\n\nCopyright © 2026")
+                .title("About MDGEM")
                 .kind(tauri_plugin_dialog::MessageDialogKind::Info)
                 .show(|_| {});
         }
@@ -359,7 +359,7 @@ pub fn run() {
                 "main",
                 WebviewUrl::App("viewer.html".into()),
             )
-            .title("MDReader")
+            .title("MDGEM")
             .inner_size(900.0, 720.0)
             .min_inner_size(520.0, 360.0)
             .resizable(true)

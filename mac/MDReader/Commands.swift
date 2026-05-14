@@ -5,7 +5,7 @@ struct MDReaderCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .appInfo) {
-            Button("About MDReader") {
+            Button("About MDGEM") {
                 NSApp.orderFrontStandardAboutPanel()
             }
         }

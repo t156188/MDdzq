@@ -1,6 +1,6 @@
-# MDReader (Windows)
+# MDGEM (Windows)
 
-Windows 版 MDReader，与同仓库的 macOS `mac/` 并列。**完全复用** Mac 版的前端渲染层（`../mac/Resources/`），仅替换原生壳：`SwiftUI + WKWebView` → `Tauri 2 (Rust) + WebView2`。
+Windows 版 MDGEM，与同仓库的 macOS `mac/` 并列。**完全复用** Mac 版的前端渲染层（`../mac/Resources/`），仅替换原生壳：`SwiftUI + WKWebView` → `Tauri 2 (Rust) + WebView2`。
 
 UI 与 Mac 版逐像素一致（同一套 HTML/CSS/JS）。
 
@@ -67,7 +67,7 @@ cargo install tauri-cli --version "^2" --locked   # 一次性
 cargo tauri build --bundles nsis
 ```
 
-产物：`src-tauri/target/release/bundle/nsis/MDReader_0.1.0_x64-setup.exe`
+产物：`src-tauri/target/release/bundle/nsis/MDGEM_0.1.0_x64-setup.exe`
 
 **路 B：GitHub Actions（无需自己有 Win 机器）**
 

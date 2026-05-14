@@ -2,7 +2,7 @@ DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
 export DEVELOPER_DIR
 
 BUILD_DIR := build
-APP_PATH := $(BUILD_DIR)/Build/Products/Release/MDReader.app
+APP_PATH := $(BUILD_DIR)/Build/Products/Release/MDGEM.app
 
 .PHONY: all web project build run open clean
 

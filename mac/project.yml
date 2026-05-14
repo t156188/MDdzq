@@ -31,7 +31,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lv.mdreader
-        PRODUCT_NAME: MDReader
+        PRODUCT_NAME: MDGEM
         INFOPLIST_FILE: MDReader/Info.plist
         CODE_SIGN_ENTITLEMENTS: MDReader/MDReader.entitlements
         GENERATE_INFOPLIST_FILE: NO
