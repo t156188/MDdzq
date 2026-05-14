@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 extension Notification.Name {
     static let mdreaderToggleSidebar = Notification.Name("mdreader.toggleSidebar")
@@ -13,6 +14,16 @@ struct MDReaderCommands: Commands {
             Button("About MDGEM") {
                 NSApp.orderFrontStandardAboutPanel()
             }
+        }
+        // The default File → Open… (provided by DocumentGroup) uses an
+        // NSOpenPanel hard-coded to canChooseDirectories=false. Adding
+        // public.folder to readableContentTypes alone doesn't lift that
+        // restriction, so we ship a dedicated "Open Folder…" entry.
+        CommandGroup(after: .newItem) {
+            Button("Open Folder…") {
+                openFolder()
+            }
+            .keyboardShortcut("o", modifiers: [.command, .shift])
         }
         CommandGroup(after: .toolbar) {
             Button("Toggle Sidebar") {
@@ -34,5 +45,23 @@ struct MDReaderCommands: Commands {
                 .keyboardShortcut("0", modifiers: .command)
             Divider()
         }
+    }
+}
+
+@MainActor
+private func openFolder() {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    panel.canCreateDirectories = false
+    panel.prompt = "Open"
+    panel.message = "Choose a folder to open as a workspace"
+    panel.begin { response in
+        guard response == .OK, let url = panel.url else { return }
+        NSDocumentController.shared.openDocument(
+            withContentsOf: url,
+            display: true
+        ) { _, _, _ in }
     }
 }

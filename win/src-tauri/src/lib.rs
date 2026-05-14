@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{
@@ -15,6 +16,18 @@ use url::Url;
 const MD_EXTS: &[&str] = &["md", "markdown", "mdown", "mkd", "mkdn"];
 const STORE_FILE: &str = "settings.json";
 const STORE_KEY_THEME: &str = "themeOverride"; // "system" | "light" | "dark"
+const STORE_KEY_ZOOM: &str = "pageZoom";       // 0.4 ..= 3.0
+const STORE_KEY_RECENTS: &str = "recentFiles"; // newest-first list of absolute paths
+const RECENTS_MAX: usize = 12;
+
+/// Directory names we never recurse into eagerly. They still appear in the
+/// tree, but the front-end fetches their children on demand (see
+/// `mdreader:scan-dir`). Keeps `node_modules`/build output from freezing the
+/// UI when opening large workspaces.
+const LAZY_DIR_NAMES: &[&str] = &[
+    "node_modules", "dist", "build", "out", "target", "vendor",
+    "release", "coverage", "Pods", "DerivedData", "__pycache__",
+];
 
 #[derive(Default)]
 struct OpenState {
@@ -24,6 +37,9 @@ struct OpenState {
     /// not change this — only "new document" entry points (initial argv,
     /// drag-drop, File → Open, single-instance forward).
     workspace_root: Mutex<Option<PathBuf>>,
+    /// Recursive FS watcher for the current workspace. Dropping it closes
+    /// the underlying handle and lets the consumer thread exit.
+    watcher: Mutex<Option<RecommendedWatcher>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -46,6 +62,23 @@ struct FileTreeNode {
     path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     children: Option<Vec<FileTreeNode>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lazy: Option<bool>,
+}
+
+#[derive(Serialize, Clone)]
+struct ScanDirResult {
+    #[serde(rename = "reqId")]
+    req_id: String,
+    path: String,
+    children: Vec<FileTreeNode>,
+}
+
+#[derive(Deserialize)]
+struct ScanDirRequest {
+    path: String,
+    #[serde(rename = "reqId")]
+    req_id: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -88,7 +121,10 @@ fn absolutize(p: PathBuf) -> PathBuf {
     }
 }
 
-fn pick_md_from_args<I, S>(args: I) -> Option<PathBuf>
+/// Pick the first argv entry that points to either a markdown file or a
+/// directory. Used both for initial argv and for second-instance forwarding
+/// (single-instance plugin).
+fn pick_target_from_args<I, S>(args: I) -> Option<PathBuf>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
@@ -101,12 +137,48 @@ where
         if s.starts_with('-') {
             continue;
         }
-        let p = PathBuf::from(s);
+        let p = absolutize(PathBuf::from(s));
         if is_markdown_path(&p) {
-            return Some(absolutize(p));
+            return Some(p);
+        }
+        if p.is_dir() {
+            return Some(p);
         }
     }
     None
+}
+
+/// Pick a "default" md inside a folder — README.* wins (case-insensitive),
+/// otherwise the first .md/.markdown/... in alpha order. Only the immediate
+/// children are inspected — opening a giant tree shouldn't recurse here.
+fn find_default_md_in_dir(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|r| r.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && is_markdown_path(p))
+        .collect();
+    files.sort_by(|a, b| {
+        a.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase()
+            .cmp(
+                &b.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase(),
+            )
+    });
+    // README.<md-ext> first, case-insensitive.
+    if let Some(p) = files.iter().find(|p| {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("README"))
+            .unwrap_or(false)
+    }) {
+        return Some(p.clone());
+    }
+    files.into_iter().next()
 }
 
 fn read_text(path: &Path) -> Result<String, String> {
@@ -126,7 +198,8 @@ fn read_theme_pref(app: &AppHandle) -> String {
             }
         }
     }
-    "system".to_string()
+    // No stored preference (fresh install) → default to dark.
+    "dark".to_string()
 }
 
 fn write_theme_pref(app: &AppHandle, value: &str) {
@@ -134,6 +207,83 @@ fn write_theme_pref(app: &AppHandle, value: &str) {
         store.set(STORE_KEY_THEME, serde_json::Value::String(value.to_string()));
         let _ = store.save();
     }
+}
+
+fn read_recents(app: &AppHandle) -> Vec<String> {
+    if let Ok(store) = app.store(STORE_FILE) {
+        if let Some(v) = store.get(STORE_KEY_RECENTS) {
+            if let Some(arr) = v.as_array() {
+                return arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn write_recents(app: &AppHandle, list: &[String]) {
+    if let Ok(store) = app.store(STORE_FILE) {
+        store.set(STORE_KEY_RECENTS, serde_json::json!(list));
+        let _ = store.save();
+    }
+}
+
+fn add_recent(app: &AppHandle, path: &Path) {
+    let p = path.to_string_lossy().to_string();
+    if p.is_empty() {
+        return;
+    }
+    let mut list = read_recents(app);
+    list.retain(|x| x != &p);
+    list.insert(0, p);
+    list.truncate(RECENTS_MAX);
+    write_recents(app, &list);
+    if let Some(w) = app.get_webview_window("main") {
+        push_recents(&w, &list);
+    }
+}
+
+/// Drop entries whose target no longer exists. Cheap to do — we only ever
+/// keep RECENTS_MAX paths.
+fn prune_recents(app: &AppHandle) {
+    let list = read_recents(app);
+    let alive: Vec<String> = list
+        .into_iter()
+        .filter(|p| Path::new(p).exists())
+        .collect();
+    write_recents(app, &alive);
+}
+
+fn push_recents(window: &WebviewWindow, list: &[String]) {
+    let _ = window.emit("mdreader:recents", list);
+}
+
+fn read_zoom_pref(app: &AppHandle) -> f64 {
+    if let Ok(store) = app.store(STORE_FILE) {
+        if let Some(v) = store.get(STORE_KEY_ZOOM) {
+            if let Some(n) = v.as_f64() {
+                return n.clamp(0.4, 3.0);
+            }
+        }
+    }
+    1.0
+}
+
+fn write_zoom_pref(app: &AppHandle, value: f64) {
+    if let Ok(store) = app.store(STORE_FILE) {
+        store.set(STORE_KEY_ZOOM, serde_json::json!(value));
+        let _ = store.save();
+    }
+}
+
+fn push_zoom(window: &WebviewWindow, value: f64) {
+    let js = format!(
+        "window.__mdr_zoom = {z}; document.body.style.zoom = {z};",
+        z = value
+    );
+    let _ = window.eval(&js);
 }
 
 fn effective_theme_name(app: &AppHandle, window: &WebviewWindow) -> &'static str {
@@ -168,56 +318,81 @@ fn display_name(p: &Path) -> String {
         .unwrap_or_else(|| p.to_string_lossy().to_string())
 }
 
+fn is_lazy_dir_name(name: &str) -> bool {
+    LAZY_DIR_NAMES.iter().any(|n| *n == name)
+}
+
+/// Read + sort the immediate children of `dir`, applying the same hidden-file
+/// + lazy-dir rules as the full scan.
+fn scan_children(dir: &Path) -> Vec<FileTreeNode> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|r| r.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| !s.starts_with('.'))
+                .unwrap_or(false)
+        })
+        .collect();
+    paths.sort_by(|a, b| {
+        let a_dir = a.is_dir();
+        let b_dir = b.is_dir();
+        if a_dir != b_dir {
+            return if a_dir {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        a.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase()
+            .cmp(
+                &b.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase(),
+            )
+    });
+    let mut out = Vec::new();
+    for p in paths {
+        if let Some(n) = scan_tree(&p, false) {
+            out.push(n);
+        }
+    }
+    out
+}
+
 fn scan_tree(url: &Path, is_root: bool) -> Option<FileTreeNode> {
     let metadata = std::fs::metadata(url).ok()?;
     if metadata.is_dir() {
-        let entries = std::fs::read_dir(url).ok()?;
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|r| r.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|s| !s.starts_with('.'))
-                    .unwrap_or(false)
-            })
-            .collect();
-        // Folders first (alpha), then files (alpha). Mirrors the typical
-        // file-tree UI (Explorer, VS Code Explorer, etc.).
-        paths.sort_by(|a, b| {
-            let a_dir = a.is_dir();
-            let b_dir = b.is_dir();
-            if a_dir != b_dir {
-                return if a_dir {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Greater
-                };
-            }
-            a.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase()
-                .cmp(
-                    &b.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_lowercase(),
-                )
-        });
-        let mut children = Vec::new();
-        for p in paths {
-            if let Some(n) = scan_tree(&p, false) {
-                children.push(n);
-            }
+        // Heavy directory → stub with lazy=true. Root is exempt so opening a
+        // file directly inside e.g. `node_modules` still shows a populated
+        // sidebar.
+        let name = display_name(url);
+        if !is_root && is_lazy_dir_name(&name) {
+            return Some(FileTreeNode {
+                kind: "dir".to_string(),
+                name,
+                path: url.to_string_lossy().to_string(),
+                children: None,
+                lazy: Some(true),
+            });
         }
+        let children = scan_children(url);
         if !is_root && children.is_empty() {
             return None;
         }
         Some(FileTreeNode {
             kind: "dir".to_string(),
-            name: display_name(url),
+            name,
             path: url.to_string_lossy().to_string(),
             children: Some(children),
+            lazy: None,
         })
     } else {
         if !is_markdown_path(url) {
@@ -228,6 +403,7 @@ fn scan_tree(url: &Path, is_root: bool) -> Option<FileTreeNode> {
             name: display_name(url),
             path: url.to_string_lossy().to_string(),
             children: None,
+            lazy: None,
         })
     }
 }
@@ -241,6 +417,86 @@ fn push_file_tree(window: &WebviewWindow, workspace_root: &Path, current: Option
         current: current.map(|p| p.to_string_lossy().to_string()),
     };
     let _ = window.emit("mdreader:file-tree", payload);
+}
+
+/// Spawn a recursive FS watcher rooted at `root` and a consumer thread that
+/// coalesces events inside a 300ms window before refreshing the sidebar tree
+/// and (when relevant) re-rendering the currently open file.
+fn start_watcher(app: AppHandle, root: PathBuf) -> Option<RecommendedWatcher> {
+    let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher: RecommendedWatcher = notify::recommended_watcher(
+        move |res: notify::Result<notify::Event>| {
+            // If the receiver was dropped (workspace replaced) the send fails
+            // and the watcher will be torn down by its owner.
+            let _ = tx.send(res);
+        },
+    )
+    .ok()?;
+    watcher
+        .watch(&root, RecursiveMode::Recursive)
+        .ok()?;
+
+    let app_handle = app;
+    std::thread::spawn(move || {
+        use std::time::{Duration, Instant};
+        let debounce = Duration::from_millis(300);
+        loop {
+            let first = match rx.recv() {
+                Ok(v) => v,
+                Err(_) => break, // watcher dropped; thread exits cleanly
+            };
+            let mut paths: Vec<PathBuf> = Vec::new();
+            if let Ok(ev) = first {
+                paths.extend(ev.paths);
+            }
+            // Drain everything that arrives inside the debounce window so a
+            // burst of writes (npm install, git checkout…) lands in one
+            // refresh instead of N.
+            let deadline = Instant::now() + debounce;
+            loop {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                match rx.recv_timeout(remaining) {
+                    Ok(Ok(ev)) => paths.extend(ev.paths),
+                    Ok(Err(_)) => {}
+                    Err(_) => break, // timeout or channel closed
+                }
+            }
+            handle_fs_change(&app_handle, paths);
+        }
+    });
+    Some(watcher)
+}
+
+fn handle_fs_change(app: &AppHandle, paths: Vec<PathBuf>) {
+    refresh_tree(app);
+    let state = app.state::<OpenState>();
+    let current = state.current_file.lock().unwrap().clone();
+    let Some(cur) = current else { return };
+    let cur_canon = std::fs::canonicalize(&cur).unwrap_or_else(|_| cur.clone());
+    let touched = paths.iter().any(|p| {
+        std::fs::canonicalize(p)
+            .map(|c| c == cur_canon)
+            .unwrap_or(false)
+    });
+    if touched {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = push_render(&w, &cur);
+        }
+    }
+}
+
+/// Set the workspace root and (re)start the FS watcher. Pass `None` to clear.
+fn set_workspace_root(app: &AppHandle, root: Option<PathBuf>) {
+    let state = app.state::<OpenState>();
+    // Drop the old watcher *first* so its sender closes and the consumer
+    // thread exits before a fresh one starts.
+    *state.watcher.lock().unwrap() = None;
+    *state.workspace_root.lock().unwrap() = root.clone();
+    if let Some(path) = root {
+        *state.watcher.lock().unwrap() = start_watcher(app.clone(), path);
+    }
 }
 
 fn refresh_tree(app: &AppHandle) {
@@ -280,6 +536,35 @@ fn push_render(window: &WebviewWindow, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Branch on whether the user pointed us at a file or a directory:
+/// - File → existing `load_file` path.
+/// - Directory → set workspace_root, auto-open a sensible md inside (if any),
+///   and push the file tree so the sidebar comes up populated.
+fn load_target(window: &WebviewWindow, path: PathBuf, mode: LoadMode) {
+    if path.is_dir() {
+        let app = window.app_handle().clone();
+        if matches!(mode, LoadMode::NewWorkspace) {
+            set_workspace_root(&app, Some(path.clone()));
+        }
+        if let Some(pick) = find_default_md_in_dir(&path) {
+            // Reuse load_file but keep the workspace we just set — sidebar
+            // click semantics, not "new workspace from a file's parent".
+            load_file(window, pick, LoadMode::KeepWorkspace);
+        } else {
+            // Folder with no md inside: clear the current document and just
+            // refresh the tree.
+            let state = app.state::<OpenState>();
+            *state.current_file.lock().unwrap() = None;
+            let root = state.workspace_root.lock().unwrap().clone();
+            if let Some(root) = root {
+                push_file_tree(window, &root, None);
+            }
+        }
+    } else {
+        load_file(window, path, mode);
+    }
+}
+
 fn load_file(window: &WebviewWindow, path: PathBuf, mode: LoadMode) {
     let app = window.app_handle().clone();
     if let Err(err) = push_render(window, &path) {
@@ -291,16 +576,17 @@ fn load_file(window: &WebviewWindow, path: PathBuf, mode: LoadMode) {
             .blocking_show();
         return;
     }
-    let state = app.state::<OpenState>();
-    *state.current_file.lock().unwrap() = Some(path.clone());
     if matches!(mode, LoadMode::NewWorkspace) {
         let new_root = path.parent().map(|p| p.to_path_buf());
-        *state.workspace_root.lock().unwrap() = new_root;
+        set_workspace_root(&app, new_root);
     }
+    let state = app.state::<OpenState>();
+    *state.current_file.lock().unwrap() = Some(path.clone());
     let root = state.workspace_root.lock().unwrap().clone();
     if let Some(root) = root {
         push_file_tree(window, &root, Some(&path));
     }
+    add_recent(&app, &path);
 }
 
 fn open_file_dialog(window: WebviewWindow) {
@@ -426,6 +712,37 @@ fn handle_fs_op(app: &AppHandle, op: FsOp) {
                 Err(e) => toast(&w, &format!("Delete failed: {e}"), "error"),
             }
         }
+        "newFile" | "newFolder" => {
+            let Some(name) = op.new_name
+                .as_ref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            else {
+                toast(&w, "Invalid name", "error");
+                return;
+            };
+            if name.contains('/') || name.contains('\\') {
+                toast(&w, "Name cannot contain / or \\", "error");
+                return;
+            }
+            let dst = path.join(&name);
+            if dst.exists() {
+                toast(&w, "Already exists", "error");
+                return;
+            }
+            let result = if op.op == "newFolder" {
+                std::fs::create_dir(&dst)
+            } else {
+                std::fs::write(&dst, "")
+            };
+            match result {
+                Ok(_) => {
+                    refresh_tree(app);
+                    toast(&w, "Created", "info");
+                }
+                Err(e) => toast(&w, &format!("Create failed: {e}"), "error"),
+            }
+        }
         _ => {}
     }
 }
@@ -533,12 +850,16 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         }
         "zoomIn" | "zoomOut" | "zoomReset" => {
             if let Some(w) = window {
-                let js = match id {
-                    "zoomIn" => "window.__mdr_zoom = Math.min(3, (window.__mdr_zoom || 1) + 0.1); document.body.style.zoom = window.__mdr_zoom;",
-                    "zoomOut" => "window.__mdr_zoom = Math.max(0.4, (window.__mdr_zoom || 1) - 0.1); document.body.style.zoom = window.__mdr_zoom;",
-                    _ => "window.__mdr_zoom = 1; document.body.style.zoom = 1;",
+                let cur = read_zoom_pref(app);
+                let next = match id {
+                    "zoomIn" => (cur + 0.1).min(3.0),
+                    "zoomOut" => (cur - 0.1).max(0.4),
+                    _ => 1.0,
                 };
-                let _ = w.eval(js);
+                // Round to 2 decimals so repeated steps don't drift (0.1+0.1 → 0.2…).
+                let next = (next * 100.0).round() / 100.0;
+                write_zoom_pref(app, next);
+                push_zoom(&w, next);
             }
         }
         "toggleSidebar" => {
@@ -570,9 +891,16 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 }
 
 fn handle_drop(app: &AppHandle, paths: Vec<PathBuf>) {
-    if let Some(p) = paths.into_iter().find(|p| is_markdown_path(p)) {
+    // Prefer an actual .md drop (most explicit intent); fall back to a
+    // dropped directory (treat as workspace).
+    let pick = paths
+        .iter()
+        .find(|p| is_markdown_path(p))
+        .cloned()
+        .or_else(|| paths.into_iter().find(|p| p.is_dir()));
+    if let Some(p) = pick {
         if let Some(w) = app.get_webview_window("main") {
-            load_file(&w, p, LoadMode::NewWorkspace);
+            load_target(&w, p, LoadMode::NewWorkspace);
         }
     }
 }
@@ -581,7 +909,7 @@ const BRIDGE_JS: &str = include_str!("bridge.js");
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let initial_file = pick_md_from_args(std::env::args());
+    let initial_target = pick_target_from_args(std::env::args());
 
     let app = tauri::Builder::default()
         .manage(OpenState::default())
@@ -589,8 +917,8 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.unminimize();
                 let _ = w.set_focus();
-                if let Some(p) = pick_md_from_args(argv) {
-                    load_file(&w, p, LoadMode::NewWorkspace);
+                if let Some(p) = pick_target_from_args(argv) {
+                    load_target(&w, p, LoadMode::NewWorkspace);
                 }
             }
         }))
@@ -611,12 +939,29 @@ pub fn run() {
             let handle = app.handle().clone();
             let _ = rebuild_menu(&handle);
 
-            // Queue any argv file before window opens; JS will pull it once ready.
-            if let Some(p) = initial_file.clone() {
-                let state = handle.state::<OpenState>();
-                *state.current_file.lock().unwrap() = Some(p.clone());
-                *state.workspace_root.lock().unwrap() = p.parent().map(|x| x.to_path_buf());
+            // Queue any argv target before window opens; JS will pull it once
+            // ready. For directories the workspace IS the target; we also
+            // pre-pick a default README/first-md so the viewer comes up with
+            // something to show.
+            if let Some(p) = initial_target.clone() {
+                if p.is_dir() {
+                    set_workspace_root(&handle, Some(p.clone()));
+                    let picked = find_default_md_in_dir(&p);
+                    if let Some(file) = picked.as_ref() {
+                        add_recent(&handle, file);
+                    }
+                    let state = handle.state::<OpenState>();
+                    *state.current_file.lock().unwrap() = picked;
+                } else {
+                    set_workspace_root(&handle, p.parent().map(|x| x.to_path_buf()));
+                    let state = handle.state::<OpenState>();
+                    *state.current_file.lock().unwrap() = Some(p.clone());
+                    add_recent(&handle, &p);
+                }
             }
+            // Drop stale recents (files removed since last session) before the
+            // page reads them — keeps the menu honest at startup.
+            prune_recents(&handle);
 
             let _window = WebviewWindowBuilder::new(
                 app,
@@ -637,6 +982,8 @@ pub fn run() {
                     let pref = read_theme_pref(&h_ready);
                     let name = effective_theme_name(&h_ready, &w);
                     push_theme(&w, name, &pref);
+                    push_zoom(&w, read_zoom_pref(&h_ready));
+                    push_recents(&w, &read_recents(&h_ready));
                     let state = h_ready.state::<OpenState>();
                     let pending = state.current_file.lock().unwrap().clone();
                     let root = state.workspace_root.lock().unwrap().clone();
@@ -680,6 +1027,58 @@ pub fn run() {
                     Err(_) => return,
                 };
                 handle_fs_op(&h_op, op);
+            });
+
+            // Lazy-folder expansion: JS asks for the immediate children of a
+            // single directory. Run on a worker thread so large folders don't
+            // block the event loop.
+            let h_scan = handle.clone();
+            handle.listen_any("mdreader:scan-dir", move |event| {
+                let req: ScanDirRequest = match serde_json::from_str(event.payload()) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let h = h_scan.clone();
+                std::thread::spawn(move || {
+                    let path = PathBuf::from(&req.path);
+                    let children = if path.is_dir() {
+                        scan_children(&path)
+                    } else {
+                        Vec::new()
+                    };
+                    if let Some(w) = h.get_webview_window("main") {
+                        let _ = w.emit(
+                            "mdreader:scan-dir-result",
+                            ScanDirResult {
+                                req_id: req.req_id,
+                                path: req.path,
+                                children,
+                            },
+                        );
+                    }
+                });
+            });
+
+            // Sidebar Recent menu: open a recent file as a brand-new workspace
+            // (its parent directory). If the file is gone, prune the list and
+            // tell the user.
+            let h_recent = handle.clone();
+            handle.listen_any("mdreader:open-recent", move |event| {
+                let raw: String =
+                    serde_json::from_str(event.payload()).unwrap_or_default();
+                if raw.is_empty() {
+                    return;
+                }
+                let path = PathBuf::from(&raw);
+                if let Some(w) = h_recent.get_webview_window("main") {
+                    if !path.exists() {
+                        toast(&w, "That file no longer exists", "error");
+                        prune_recents(&h_recent);
+                        push_recents(&w, &read_recents(&h_recent));
+                        return;
+                    }
+                    load_target(&w, path, LoadMode::NewWorkspace);
+                }
             });
 
             // Sidebar theme toggle: JS pushes the user's preference, we

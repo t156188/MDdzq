@@ -1,10 +1,18 @@
 import { build } from 'esbuild';
-import { cp, mkdir, rm } from 'node:fs/promises';
+import { cp, mkdir, readFile, rm } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const outDir = resolve(__dirname, '../Resources/vendor');
+
+// Stamp the bundle with this package's version so the sidebar can show it
+// without an IPC roundtrip. Kept in sync via the release-bump rule (see
+// CLAUDE.md).
+const pkg = JSON.parse(
+  await readFile(resolve(__dirname, 'package.json'), 'utf-8')
+);
+const APP_VERSION = pkg.version || '0.0.0';
 
 await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });
@@ -20,6 +28,9 @@ await build({
   outfile: resolve(outDir, 'viewer.bundle.js'),
   target: ['safari16'],
   legalComments: 'none',
+  define: {
+    __APP_VERSION__: JSON.stringify(APP_VERSION),
+  },
 });
 
 await build({

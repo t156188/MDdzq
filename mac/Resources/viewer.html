@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -54,6 +54,7 @@
             </div>
           </div>
         </div>
+        <span class="sb-version" id="sb-version" aria-label="App version"></span>
       </footer>
       <div class="sb-resize" id="sb-resize" aria-hidden="true"></div>
     </aside>
@@ -63,6 +64,9 @@
       <div id="empty-state" class="empty-state" hidden>
         <div class="empty-glyph">.md</div>
         <div class="empty-text">Open a Markdown file to begin</div>
+      </div>
+      <div id="loading-state" class="loading-state" hidden aria-hidden="true">
+        <div class="loading-dots"><span></span><span></span><span></span></div>
       </div>
     </main>
     <script src="vendor/viewer.bundle.js"></script>

@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 
 @main
 struct MDReaderApp: App {
-    @AppStorage("themeOverride") private var themeOverride: String = "system"
+    @AppStorage("themeOverride") private var themeOverride: String = "dark"
     @AppStorage("pageZoom") private var pageZoom: Double = 1.0
 
     var body: some Scene {

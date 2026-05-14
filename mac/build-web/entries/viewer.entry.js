@@ -153,7 +153,55 @@ function updateEmptyState() {
   const empty = document.getElementById('empty-state');
   const root = document.getElementById('root');
   if (!empty || !root) return;
-  empty.hidden = root.children.length > 0;
+  // Hide the "Open a file" placeholder while a load is in flight, so the
+  // dots aren't fighting with the empty-state glyph in the same space.
+  const loading = document.getElementById('main')?.classList.contains('is-loading');
+  empty.hidden = loading || root.children.length > 0;
+}
+
+// Loading indicator — shown after a short delay so fast reads don't flicker
+// a spinner on screen. Cancelled the moment `render()` runs or `setLoading(false)`
+// is called explicitly by the host. A safety timeout auto-clears the indicator
+// if the host never reports back (e.g. native dedupes the load).
+let loadingShowTimer = null;
+let loadingSafetyTimer = null;
+function setLoading(visible) {
+  const main = document.getElementById('main');
+  const node = document.getElementById('loading-state');
+  if (!main || !node) return;
+  if (loadingShowTimer) {
+    clearTimeout(loadingShowTimer);
+    loadingShowTimer = null;
+  }
+  if (loadingSafetyTimer) {
+    clearTimeout(loadingSafetyTimer);
+    loadingSafetyTimer = null;
+  }
+  if (visible) {
+    // 80ms grace — anything that resolves faster won't trigger the indicator.
+    loadingShowTimer = setTimeout(() => {
+      loadingShowTimer = null;
+      main.classList.add('is-loading');
+      node.hidden = false;
+      // Force layout so the opacity transition runs on the next frame.
+      void node.offsetWidth;
+      node.classList.add('is-visible');
+      updateEmptyState();
+    }, 80);
+    // If no render() arrives within 8s, give up rather than stranding the UI.
+    loadingSafetyTimer = setTimeout(() => {
+      loadingSafetyTimer = null;
+      setLoading(false);
+    }, 8000);
+  } else {
+    main.classList.remove('is-loading');
+    node.classList.remove('is-visible');
+    // Wait out the fade-out before hiding so the dots don't pop.
+    setTimeout(() => {
+      if (!main.classList.contains('is-loading')) node.hidden = true;
+    }, 220);
+    updateEmptyState();
+  }
 }
 
 async function render(text, baseDir) {
@@ -183,6 +231,7 @@ async function render(text, baseDir) {
   const main = document.getElementById('main') || document.scrollingElement;
   if (main) main.scrollTop = 0;
   Sidebar.setOutline(outline);
+  setLoading(false);
   updateEmptyState();
   try {
     window.webkit?.messageHandlers?.didRender?.postMessage({ length: text.length });
@@ -230,6 +279,7 @@ function setTheme(arg) {
 // ===================================================================
 
 function requestOpenFile(path) {
+  setLoading(true);
   try {
     if (window.webkit?.messageHandlers?.openFile) {
       window.webkit.messageHandlers.openFile.postMessage({ path });
@@ -244,12 +294,49 @@ function requestOpenFile(path) {
   } catch {}
 }
 
+// Pending lazy-folder scans — reqId → path, plus the set of folder paths
+// currently waiting on a host response (drives the inline spinner).
+const pendingScans = new Map();
+const loadingDirs = new Set();
+let scanSeq = 0;
+
+function requestScanDir(path) {
+  const reqId = `sd-${Date.now().toString(36)}-${(++scanSeq).toString(36)}`;
+  pendingScans.set(reqId, path);
+  loadingDirs.add(path);
+  try {
+    if (window.webkit?.messageHandlers?.scanDir) {
+      window.webkit.messageHandlers.scanDir.postMessage({ path, reqId });
+      return;
+    }
+  } catch {}
+  try {
+    const ev = window.__TAURI__?.event;
+    if (ev && typeof ev.emit === 'function') {
+      ev.emit('mdreader:scan-dir', { path, reqId });
+      return;
+    }
+  } catch {}
+  // No host bridge available — drop the spinner so the UI doesn't hang.
+  pendingScans.delete(reqId);
+  loadingDirs.delete(path);
+}
+
 const Sidebar = (() => {
   let currentTree = null;        // { root, current }
   let currentOutline = [];
   const expanded = new Set();    // paths of expanded dirs
   let lastTreeKey = '';          // memoize tree shape so re-renders are cheap
+  // Lazy folders (node_modules, dist, …) come back from the host as stubs
+  // every time the tree is re-pushed. Once the user has expanded one, cache
+  // its children here so subsequent setFileTree() calls can re-hydrate the
+  // stub — otherwise opening an md inside such a folder would collapse it.
+  const scannedDirs = new Map();
+  let currentRootPath = '';
   let currentThemePref = 'system';
+  // Native hosts still push recents via MDViewerAPI.setRecents — held here in
+  // case a UI is reintroduced; nothing renders them today.
+  let currentRecents = [];
 
   function el(id) { return document.getElementById(id); }
 
@@ -283,7 +370,17 @@ const Sidebar = (() => {
     });
 
     // Initial render — pref is overridden once the host pushes its real value.
-    setThemePref(localStorage.getItem('mdreader.theme.pref') || 'system');
+    // Fresh users (no localStorage entry) fall back to dark.
+    setThemePref(localStorage.getItem('mdreader.theme.pref') || 'dark');
+
+    // Stamp the bundle's package version into the sidebar footer. The literal
+    // is injected by esbuild's `define` (see build.mjs); falls back gracefully
+    // if someone runs the source outside the bundle.
+    const ver = el('sb-version');
+    if (ver) {
+      const v = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : '';
+      ver.textContent = v ? `v${v}` : '';
+    }
 
     initResize();
     updateEmptyState();
@@ -373,13 +470,60 @@ const Sidebar = (() => {
 
   function setFileTree(payload) {
     currentTree = payload && payload.root ? payload : null;
+    if (currentTree?.root) {
+      // If the workspace root changed, the cached lazy-dir contents from the
+      // previous workspace are stale.
+      if (currentTree.root.path !== currentRootPath) {
+        scannedDirs.clear();
+        currentRootPath = currentTree.root.path;
+      }
+      // Re-hydrate any lazy nodes whose children we previously scanned, so
+      // the host's "lazy stub" doesn't collapse a folder the user expanded.
+      walk(currentTree.root, (node) => {
+        if (node.type === 'dir' && node.lazy && scannedDirs.has(node.path)) {
+          node.children = scannedDirs.get(node.path);
+          node.lazy = false;
+        }
+      });
+    }
     autoExpand();
+    renderFiles();
+  }
+
+  function onScanDirResult(reqId, payload) {
+    const path = pendingScans.get(reqId);
+    if (!path) return;
+    pendingScans.delete(reqId);
+    loadingDirs.delete(path);
+    if (!currentTree?.root || !payload) {
+      renderFiles();
+      return;
+    }
+    const targetPath = payload.path || path;
+    const children = Array.isArray(payload.children) ? payload.children : [];
+    walk(currentTree.root, (node) => {
+      if (node.type === 'dir' && node.path === targetPath) {
+        node.children = children;
+        node.lazy = false;
+      }
+    });
+    scannedDirs.set(targetPath, children);
+    // Keep memo in sync so a later auto-expand doesn't wipe what we just
+    // loaded.
+    lastTreeKey = treeKey(currentTree.root);
     renderFiles();
   }
 
   function setOutline(items) {
     currentOutline = Array.isArray(items) ? items : [];
     renderOutline();
+  }
+
+  // No-op holder. The visible Recent files menu was removed; the native
+  // side still tracks recents and pushes them here, so reintroducing a UI
+  // later (right-click, command palette, …) just needs to read this list.
+  function setRecents(list) {
+    currentRecents = Array.isArray(list) ? list.filter((s) => typeof s === 'string') : [];
   }
 
   function autoExpand() {
@@ -443,17 +587,40 @@ const Sidebar = (() => {
     label.textContent = node.name || node.path;
 
     if (node.type === 'dir') {
+      const isLazy = !!node.lazy;
+      const isLoading = loadingDirs.has(node.path);
       const open = expanded.has(node.path);
-      toggle.textContent = open ? '▾' : '▸';
+      if (isLoading) {
+        toggle.textContent = '';
+        toggle.classList.add('tree-spinner');
+      } else {
+        toggle.textContent = open ? '▾' : '▸';
+      }
       row.appendChild(toggle);
       row.appendChild(label);
+      if (isLazy && !isLoading) {
+        const hint = document.createElement('span');
+        hint.className = 'tree-lazy-hint';
+        hint.textContent = '…';
+        hint.title = 'Click to load';
+        row.appendChild(hint);
+      }
       row.addEventListener('click', () => {
+        if (isLoading) return;
+        if (isLazy) {
+          // Treat first click as "load + open" — show spinner immediately
+          // and mark expanded so the result drops in already open.
+          expanded.add(node.path);
+          requestScanDir(node.path);
+          renderFiles();
+          return;
+        }
         if (expanded.has(node.path)) expanded.delete(node.path);
         else expanded.add(node.path);
         renderFiles();
       });
       wrap.appendChild(row);
-      if (open && node.children?.length) {
+      if (open && !isLazy && node.children?.length) {
         const kids = document.createElement('div');
         kids.className = 'tree-children';
         for (const c of node.children) kids.appendChild(buildNode(c, current));
@@ -463,7 +630,17 @@ const Sidebar = (() => {
       toggle.textContent = '';
       row.appendChild(toggle);
       row.appendChild(label);
-      row.addEventListener('click', () => requestOpenFile(node.path));
+      row.addEventListener('click', () => {
+        // Re-clicking the active file: native shells de-dupe the load (no
+        // re-render fires), which would strand the loader. Just scroll the
+        // doc to the top, mirroring what most editors do for the same case.
+        if (node.path === current) {
+          const main = document.getElementById('main');
+          if (main) main.scrollTo({ top: 0, behavior: 'smooth' });
+          return;
+        }
+        requestOpenFile(node.path);
+      });
       wrap.appendChild(row);
     }
     row.addEventListener('contextmenu', (e) => {
@@ -477,6 +654,9 @@ const Sidebar = (() => {
   function openContextMenu(x, y, node) {
     if (node.type === 'dir') {
       showContextMenu(x, y, [
+        { label: 'New File…',   action: () => promptCreate(node, 'file') },
+        { label: 'New Folder…', action: () => promptCreate(node, 'folder') },
+        'separator',
         { label: revealLabel(), action: () => fsOp({ op: 'reveal', path: node.path }) },
         { label: 'Copy Path', action: () => copyPath(node.path) },
       ]);
@@ -516,7 +696,15 @@ const Sidebar = (() => {
     }
   }
 
-  return { init, setFileTree, setOutline, setThemePref, toggleCollapsed };
+  return {
+    init,
+    setFileTree,
+    setOutline,
+    setThemePref,
+    toggleCollapsed,
+    onScanDirResult,
+    setRecents,
+  };
 })();
 
 function requestSetThemePref(value) {
@@ -624,6 +812,30 @@ async function promptRename(node) {
     return;
   }
   fsOp({ op: 'rename', path: node.path, newName });
+}
+
+async function promptCreate(parentDir, kind) {
+  const placeholder = kind === 'file' ? 'untitled.md' : 'new-folder';
+  const stemEnd = kind === 'file' && placeholder.lastIndexOf('.') > 0
+    ? placeholder.lastIndexOf('.')
+    : placeholder.length;
+  const v = await showModal({
+    title: kind === 'file' ? 'New File' : 'New Folder',
+    input: { value: placeholder, selectRange: [0, stemEnd] },
+    confirmLabel: 'Create',
+  });
+  if (typeof v !== 'string') return;
+  const name = v.trim();
+  if (!name) return;
+  if (/[\\/]/.test(name)) {
+    showToast('Name cannot contain / or \\', 'error');
+    return;
+  }
+  fsOp({
+    op: kind === 'file' ? 'newFile' : 'newFolder',
+    path: parentDir.path,
+    newName: name,
+  });
 }
 
 async function confirmDelete(node) {
@@ -845,21 +1057,27 @@ const DICE_PIPS = {
 };
 
 // Face N → cube rotation that brings face N to the camera.
-// Placement: 1 front, 2 right, 3 top, 4 bottom, 5 left, 6 back (1+6, 2+5, 3+4 opposite).
+// CSS y-axis points down, so .dice-face-3 (rotateX(-90)) is on the bottom and
+// .dice-face-4 (rotateX(+90)) is on the top — invert the X angles to bring
+// each face's outward normal to +Z. Opposite pairs still sum to 7.
 const DICE_FACE_TO_ROT = {
   1: { x: 0,   y: 0   },
   2: { x: 0,   y: -90 },
-  3: { x: -90, y: 0   },
-  4: { x: 90,  y: 0   },
+  3: { x: 90,  y: 0   },
+  4: { x: -90, y: 0   },
   5: { x: 0,   y: 90  },
   6: { x: 0,   y: 180 },
 };
 
 // Lots — weighted toward the middle, mirroring an actual fortune-stick draw.
 // Each tier carries 18 readings; pick one at random once the tier is drawn.
+// Weights tuned so 上 > 中 > 下 — the tube tilts good. 上上 / 下下 stay rare.
+//   上上=2  上=6  中=4  下=2  下下=1   →  53% 上+上上 / 27% 中 / 20% 下+下下
+// Each tier carries an `interps` pool: today's fortune in plain language,
+// always with a positive lean — even 下下 reads as "rest now, things will turn".
 const FORTUNE_LOTS = [
   {
-    tier: '上上签', weight: 1,
+    tier: '上上签', weight: 2,
     sayings: [
       '万事顺心，今日好风扑面', '心想事成的一天', '桃花、贵人、好运齐到',
       '想做的都会成', '出门见喜', '满分上签',
@@ -868,9 +1086,19 @@ const FORTUNE_LOTS = [
       '大吉大利', '鸿运当头', '阖家欢乐',
       '心愿成真', '好事自然来', '别怕，今天稳赢',
     ],
+    interps: [
+      '今日运势：诸事皆顺，做什么都有人接住',
+      '今日运势：满分天，财运、桃花、贵人都站你这边',
+      '今日运势：心想事成，记得把这份福气收下',
+      '今日运势：抬头是阳光，低头是顺风，开干就完事',
+      '今日运势：别犹豫，今天的运气配额特别足',
+      '今日运势：连堵车都让路，到哪都不会被卡住',
+      '今日运势：出门见喜，回家见礼',
+      '今日运势：所求皆得，所愿皆成',
+    ],
   },
   {
-    tier: '上签', weight: 3,
+    tier: '上签', weight: 6,
     sayings: [
       '好风正起，沿着想做的事走', '努力会有回报', '该来的都会来',
       '一切都在变好', '顺水推舟', '守得云开见月明',
@@ -878,6 +1106,16 @@ const FORTUNE_LOTS = [
       '心安即是归处', '喜事将至', '春风正暖',
       '心情爽朗，事事顺利', '不急，正在路上', '你已在好转的路上',
       '好运还在路上', '努力会有回声', '该是你的跑不掉',
+    ],
+    interps: [
+      '今日运势：风正起，事顺心，去做想做的事就好',
+      '今日运势：付出会被看见，等的人也快到了',
+      '今日运势：好事一件接一件，留点期待感',
+      '今日运势：心情松了，事情自然就顺了',
+      '今日运势：贵人在身边，多说几句没坏处',
+      '今日运势：手头的事会有进展，别急',
+      '今日运势：今天适合往前走一小步',
+      '今日运势：好运在路上，再耐心一点',
     ],
   },
   {
@@ -890,9 +1128,19 @@ const FORTUNE_LOTS = [
       '顺其自然', '稳一点', '守正待时',
       '当下足矣', '该来的会来', '平常心',
     ],
+    interps: [
+      '今日运势：稳，按部就班来就好',
+      '今日运势：无大喜也无大悲，舒服一天',
+      '今日运势：把今天平平稳稳过完就是赢',
+      '今日运势：维持现状是上策，明天再图变化',
+      '今日运势：日子刚刚好，别加戏',
+      '今日运势：守得住就有小收获',
+      '今日运势：不咸不淡，做完手上的事就够',
+      '今日运势：今天适合静下心，不必折腾',
+    ],
   },
   {
-    tier: '下签', weight: 3,
+    tier: '下签', weight: 2,
     sayings: [
       '稳一点，今日不宜冒进', '三思而后行', '谨慎行事',
       '退一步海阔天空', '今日宜守', '不宜出远门',
@@ -900,6 +1148,16 @@ const FORTUNE_LOTS = [
       '静观其变', '缓行', '不宜决断',
       '风太大，先归来', '这事儿先放一放', '今天先收一收',
       '量力而行', '别贪', '退也是一种进',
+    ],
+    interps: [
+      '今日运势：风有点大，今天先歇歇，明天会放晴',
+      '今日运势：小事别上心，大事缓一缓',
+      '今日运势：今天宜静，运气会在明天悄悄回来',
+      '今日运势：少说少做，把麻烦攒到明天一起处理',
+      '今日运势：今天累的，明天会双倍补给你',
+      '今日运势：不顺只是暂时的，下午会好转',
+      '今日运势：今日宜守，明日宜攻',
+      '今日运势：少决策、多观察，运气在调整方向',
     ],
   },
   {
@@ -912,8 +1170,34 @@ const FORTUNE_LOTS = [
       '不动为吉', '大忌：争辩', '大忌：消费',
       '大忌：表态', '听别人的别听自己的', '装睡，最好',
     ],
+    interps: [
+      '今日运势：今天先歇着，明天就有春风',
+      '今日运势：糟心事到此为止，明天重新开始',
+      '今日运势：今日宜：装睡。明日宜：重启',
+      '今日运势：哪有什么下下签，只是提醒你早点睡',
+      '今日运势：今天宇宙在测试你，过了就是大涨',
+      '今日运势：歇一歇，运气在路上充电',
+      '今日运势：闭门一日，明日开运',
+      '今日运势：今天的负能量，睡一觉就清零',
+    ],
   },
 ];
+
+// 1..100 → 一..一百 in plain Chinese numerals (for stick numbers).
+// Temple-stick numerals — uses 廿 (20s) and 卅 (30s) like real fortune sticks.
+function toChineseNum(n) {
+  const d = ['零','一','二','三','四','五','六','七','八','九'];
+  if (n <= 0) return d[0];
+  if (n < 10) return d[n];
+  if (n === 100) return '百';
+  const tens = Math.floor(n / 10);
+  const ones = n % 10;
+  if (tens === 1) return ones === 0 ? '十' : '十' + d[ones];
+  if (tens === 2) return ones === 0 ? '廿' : '廿' + d[ones];
+  if (tens === 3) return ones === 0 ? '卅' : '卅' + d[ones];
+  if (ones === 0) return d[tens] + '十';
+  return d[tens] + '十' + d[ones];
+}
 
 // 108 — 暗合佛家烦恼数；分八组写在源码里方便往后补，运行时仍是一只扁平数组。
 const FORTUNE_SAYINGS = [
@@ -1062,104 +1346,240 @@ const FORTUNE_TITLES = {
 };
 
 function showFortune(kind) {
-  if (document.querySelector('.fortune-backdrop')) return; // already open
-  if (!kind) kind = 'coin';
+  if (document.querySelector('.fortune-overlay')) return; // already open
+  switch (kind) {
+    case 'dice':   return stageDiceRoll();
+    case 'lots':   return stageLotsDraw();
+    case 'saying': return stageSpringSaying();
+    case 'coin':
+    default:       return stageCoinFlip();
+  }
+}
 
-  const backdrop = document.createElement('div');
-  backdrop.className = 'fortune-backdrop';
+// Per-kind overlay shell. The overlay catches background clicks unless a child
+// stops propagation. Each stager pushes its WAAPI animations / timers into
+// `cancellers` so close() tears them down cleanly.
+function buildFortuneOverlay(kind) {
+  const overlay = document.createElement('div');
+  overlay.className = 'fortune-overlay';
+  overlay.setAttribute('data-kind', kind);
+  document.body.appendChild(overlay);
+
+  const cancellers = [];
+  function close() {
+    cancellers.forEach((fn) => { try { fn(); } catch {} });
+    overlay.remove();
+  }
+  return { overlay, close, cancellers };
+}
+
+// Render `text` into `el` glyph by glyph — each character fades + un-blurs in,
+// like ink reaching the page. Used for lots / saying reveals.
+function inkWrite(el, text, opts) {
+  const o = opts || {};
+  const delayPer = o.delayPer != null ? o.delayPer : 80;
+  const startDelay = o.startDelay != null ? o.startDelay : 0;
+  const charDur = o.charDur != null ? o.charDur : 240;
+  el.textContent = '';
+  const chars = Array.from(text);
+  const anims = [];
+  chars.forEach((c, i) => {
+    const s = document.createElement('span');
+    s.className = 'ink-char';
+    s.textContent = c === ' ' ? ' ' : c;
+    s.style.opacity = '0';
+    el.appendChild(s);
+    const a = s.animate(
+      [
+        { opacity: 0, transform: 'translateY(5px) scale(1.06)', filter: 'blur(1.5px)' },
+        { opacity: 1, transform: 'translateY(0) scale(1)',     filter: 'blur(0)'    },
+      ],
+      { duration: charDur, delay: startDelay + i * delayPer, easing: 'ease-out', fill: 'forwards' }
+    );
+    anims.push(a);
+  });
+  return {
+    totalMs: startDelay + chars.length * delayPer + charDur,
+    cancel: () => anims.forEach((a) => { try { a.cancel(); } catch {} }),
+  };
+}
+
+// Reveal the result line + dismiss hint, styled to the kind: coin stamps in,
+// dice shakes, lots and saying write stroke by stroke.
+function revealFortune(resultEl, hintEl, text, kind) {
+  resultEl.classList.add('show');
+  if (kind === 'lots' || kind === 'saying') {
+    const out = inkWrite(resultEl, text, { delayPer: 80, charDur: 240 });
+    setTimeout(() => hintEl.classList.add('show'), Math.max(380, out.totalMs - 240));
+    return;
+  }
+  resultEl.textContent = text;
+  if (kind === 'dice') {
+    resultEl.animate(
+      [
+        { opacity: 0, transform: 'translateX(0)' },
+        { opacity: 1, transform: 'translateX(-6px)', offset: 0.25 },
+        { opacity: 1, transform: 'translateX(5px)',  offset: 0.5  },
+        { opacity: 1, transform: 'translateX(-3px)', offset: 0.75 },
+        { opacity: 1, transform: 'translateX(0)' },
+      ],
+      { duration: 520, easing: 'cubic-bezier(0.45, 0, 0.3, 1)', fill: 'forwards' }
+    );
+  } else {
+    // coin — stamp.
+    resultEl.animate(
+      [
+        { opacity: 0, transform: 'translateY(12px) scale(1.08)', letterSpacing: '0.32em' },
+        { opacity: 1, transform: 'translateY(0) scale(1)',       letterSpacing: '0.04em' },
+      ],
+      { duration: 400, easing: 'cubic-bezier(0.16, 1.2, 0.36, 1)', fill: 'forwards' }
+    );
+  }
+  setTimeout(() => hintEl.classList.add('show'), 380);
+}
+
+// === Coin: flies from the sidebar ❀ button into the card stage, lands, ripples. ===
+function stageCoinFlip() {
+  const { overlay, close, cancellers } = buildFortuneOverlay('coin');
 
   const card = document.createElement('div');
   card.className = 'fortune-card';
-  const title = FORTUNE_TITLES[kind] || '遇事不决问春风~';
   card.innerHTML =
-    `<div class="fortune-title">${title}</div>` +
+    '<div class="fortune-title">抛 · 硬 · 币</div>' +
     '<div class="fortune-stage"></div>' +
     '<div class="fortune-result"></div>' +
-    '<div class="fortune-hint">click anywhere to close</div>';
-  backdrop.appendChild(card);
-  document.body.appendChild(backdrop);
+    '<div class="fortune-hint">再 点 散 场</div>';
+  overlay.appendChild(card);
 
   const stage = card.querySelector('.fortune-stage');
   const resultEl = card.querySelector('.fortune-result');
   const hintEl = card.querySelector('.fortune-hint');
 
-  const runners = {
-    coin:   runCoinFlip,
-    dice:   runDiceRoll,
-    lots:   runLotsDraw,
-    saying: runSpringSaying,
-  };
-  const cancel = (runners[kind] || runners.coin)(stage, resultEl, hintEl);
+  const heads = Math.random() < 0.5;
+  const flips = 5 + Math.floor(Math.random() * 2);
+  const endRot = flips * 360 + (heads ? 0 : 180);
 
-  backdrop.addEventListener('click', () => {
-    if (typeof cancel === 'function') cancel();
-    backdrop.remove();
-  });
-}
-
-// Reveal the result line and the dismiss hint after the spin settles.
-function revealFortune(resultEl, hintEl, text) {
-  resultEl.textContent = text;
-  resultEl.classList.add('show');
-  setTimeout(() => hintEl.classList.add('show'), 380);
-}
-
-// 3D coin flip: rotateX with translateY arc, settles on heads or tails.
-function runCoinFlip(stage, resultEl, hintEl) {
-  stage.innerHTML =
+  const flyer = document.createElement('div');
+  flyer.className = 'coin-flyer';
+  flyer.innerHTML =
     '<div class="coin">' +
       '<div class="coin-face coin-front">正</div>' +
       '<div class="coin-face coin-back">反</div>' +
     '</div>' +
-    '<div class="coin-shadow"></div>';
+    '<div class="coin-ripple"></div>';
+  overlay.appendChild(flyer);
 
-  const coin = stage.querySelector('.coin');
-  const shadow = stage.querySelector('.coin-shadow');
-  const heads = Math.random() < 0.5;
-  const flips = 5 + Math.floor(Math.random() * 2);     // 5 or 6 full flips
-  const endRot = flips * 360 + (heads ? 0 : 180);
-  const peakLift = 60 + Math.floor(Math.random() * 12);
-
-  const coinAnim = coin.animate(
-    [
-      { transform: 'translateY(0) rotateX(0deg)' },
-      { transform: `translateY(-${peakLift}px) rotateX(${endRot * 0.5}deg)`, offset: 0.5 },
-      { transform: `translateY(0) rotateX(${endRot}deg)` },
-    ],
-    {
-      duration: 1300,
-      easing: 'cubic-bezier(0.33, 0.06, 0.45, 1)',
-      fill: 'forwards',
+  // Layout-dependent coords come after the card has been laid out.
+  requestAnimationFrame(() => {
+    const btn = document.getElementById('sb-fortune-btn');
+    let bx, by;
+    if (btn) {
+      const r = btn.getBoundingClientRect();
+      bx = r.left + r.width / 2;
+      by = r.top + r.height / 2;
     }
-  );
+    if (!bx || !by) {
+      bx = window.innerWidth / 2;
+      by = window.innerHeight - 80;
+    }
+    const sr = stage.getBoundingClientRect();
+    const tx = sr.left + sr.width / 2;
+    const ty = sr.top + sr.height / 2;
 
-  // Shadow shrinks while the coin is at peak (further from "ground") then expands back.
-  const shadowAnim = shadow.animate(
-    [
-      { transform: 'translateY(0) scale(1)', opacity: 0.32 },
-      { transform: 'translateY(0) scale(0.55)', opacity: 0.14, offset: 0.5 },
-      { transform: 'translateY(0) scale(1)', opacity: 0.32 },
-    ],
-    { duration: 1300, easing: 'ease-in-out', fill: 'forwards' }
-  );
+    flyer.style.left = bx + 'px';
+    flyer.style.top  = by + 'px';
 
-  const settle = setTimeout(() => {
-    const pool = heads ? COIN_HEADS_SAYINGS : COIN_TAILS_SAYINGS;
-    const saying = pool[Math.floor(Math.random() * pool.length)];
-    revealFortune(resultEl, hintEl, `${heads ? '正面' : '反面'} · ${saying}`);
-  }, 1300);
+    const dx = tx - bx;
+    const dy = ty - by;
+    const midX = dx / 2;
+    const midY = Math.min(0, dy) - 160; // arc peak
 
-  return () => {
-    clearTimeout(settle);
-    coinAnim.cancel();
-    shadowAnim.cancel();
-  };
+    // Translate + scale animate the flyer (no 3D needed). The rotateX flip
+    // must live on .coin (which has transform-style: preserve-3d) so the two
+    // faces' backface-visibility actually does its job — otherwise the flyer's
+    // rotation flattens .coin to 2D first and you end up seeing an upside-down
+    // "正" instead of the "反" you'd expect.
+    const flyAnim = flyer.animate(
+      [
+        { transform: 'translate(-50%, -50%) scale(0.45)' },
+        { transform: `translate(calc(-50% + ${midX}px), calc(-50% + ${midY}px)) scale(0.85)`,        offset: 0.5  },
+        { transform: `translate(calc(-50% + ${dx}px),   calc(-50% + ${dy - 8}px)) scale(1)`,         offset: 0.86 },
+        { transform: `translate(calc(-50% + ${dx}px),   calc(-50% + ${dy + 2}px)) scale(1.06, 0.92)`, offset: 0.94 },
+        { transform: `translate(calc(-50% + ${dx}px),   calc(-50% + ${dy}px))     scale(1)`           },
+      ],
+      { duration: 1150, easing: 'cubic-bezier(0.33, 0.06, 0.45, 1.05)', fill: 'forwards' }
+    );
+    cancellers.push(() => { try { flyAnim.cancel(); } catch {} });
+
+    const coin = flyer.querySelector('.coin');
+    const flipAnim = coin.animate(
+      [
+        { transform: 'rotateX(0deg)' },
+        { transform: `rotateX(${endRot * 0.45}deg)`, offset: 0.5  },
+        { transform: `rotateX(${endRot}deg)`,        offset: 0.86 },
+        { transform: `rotateX(${endRot}deg)`,        offset: 1    },
+      ],
+      { duration: 1150, easing: 'cubic-bezier(0.33, 0.06, 0.45, 1.05)', fill: 'forwards' }
+    );
+    cancellers.push(() => { try { flipAnim.cancel(); } catch {} });
+
+    const ripple = flyer.querySelector('.coin-ripple');
+    const land = setTimeout(() => {
+      const ra = ripple.animate(
+        [
+          { opacity: 0.65, transform: 'translate(-50%, -50%) scale(0.35)' },
+          { opacity: 0,    transform: 'translate(-50%, -50%) scale(2.8)' },
+        ],
+        { duration: 560, easing: 'ease-out', fill: 'forwards' }
+      );
+      cancellers.push(() => { try { ra.cancel(); } catch {} });
+
+      const pool = heads ? COIN_HEADS_SAYINGS : COIN_TAILS_SAYINGS;
+      const saying = pool[Math.floor(Math.random() * pool.length)];
+      revealFortune(resultEl, hintEl, `${heads ? '正面' : '反面'} · ${saying}`, 'coin');
+    }, 1100);
+    cancellers.push(() => clearTimeout(land));
+  });
+
+  overlay.addEventListener('click', close);
 }
 
-// 3D dice: build a real CSS cube with pips, hop + tumble on 3 axes, then land
-// with a squash. The shadow shrinks at peak and rebounds on impact so the cube
-// feels physically anchored to the surface.
-function runDiceRoll(stage, resultEl, hintEl) {
+// Scatter `count` short-lived dust motes radially from the dice's landing
+// point. Each mote is absolutely positioned in `stage` and self-removes when
+// its animation ends; if the overlay closes early, removing `stage` cancels
+// the WAAPI handles automatically.
+function spawnDust(stage, count) {
+  for (let i = 0; i < count; i++) {
+    const p = document.createElement('span');
+    p.className = 'dice-dust';
+    stage.appendChild(p);
+    const angle = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.6;
+    const dist = 22 + Math.random() * 24;
+    const dx = Math.cos(angle) * dist;
+    // Bias upward arc so motes don't sink — feels like ground dust kicked up.
+    const dy = -Math.abs(Math.sin(angle)) * dist * 0.45 + 3;
+    const dur = 420 + Math.random() * 220;
+    const a = p.animate(
+      [
+        { transform: 'translate(-50%, 0)                            scale(1)',    opacity: 0.85 },
+        { transform: `translate(calc(-50% + ${dx}px), ${dy}px) scale(0.25)`, opacity: 0    },
+      ],
+      { duration: dur, easing: 'cubic-bezier(0.2, 0.7, 0.4, 1)', fill: 'forwards' }
+    );
+    a.onfinish = () => p.remove();
+  }
+}
+
+// === Dice: in-content infinite tumble. Click / Space / Enter to stop; Esc dismisses. ===
+function stageDiceRoll() {
+  const { overlay, close, cancellers } = buildFortuneOverlay('dice');
+
+  // Stage holds the cube + its ground shadow so the shadow can stay anchored
+  // while the cube bobs above it.
+  const stage = document.createElement('div');
+  stage.className = 'dice-stage';
+  overlay.appendChild(stage);
+
   const cube = document.createElement('div');
   cube.className = 'dice-cube';
   for (let value = 1; value <= 6; value++) {
@@ -1174,153 +1594,481 @@ function runDiceRoll(stage, resultEl, hintEl) {
     cube.appendChild(face);
   }
 
-  const wrap = document.createElement('div');
-  wrap.className = 'dice-wrap';
-  wrap.appendChild(cube);
+  const cubeWrap = document.createElement('div');
+  cubeWrap.className = 'dice-wrap dice-wrap-free';
+  cubeWrap.appendChild(cube);
+  stage.appendChild(cubeWrap);
 
   const shadow = document.createElement('div');
   shadow.className = 'dice-shadow';
-
-  stage.appendChild(wrap);
   stage.appendChild(shadow);
 
-  const n = Math.floor(Math.random() * 6) + 1;
-  const target = DICE_FACE_TO_ROT[n];
-  // Multiples of 360° on every axis so the cube lands exactly on the target
-  // orientation no matter how chaotic the path between looks.
-  const spinsX = 3 + Math.floor(Math.random() * 2);
-  const spinsY = 4 + Math.floor(Math.random() * 2);
-  const signZ  = Math.random() < 0.5 ? -1 : 1;
-  const tx = spinsX * 360 + target.x;
-  const ty = spinsY * 360 + target.y;
-  const tz = (2 + Math.floor(Math.random() * 2)) * 360 * signZ;
+  const prompt = document.createElement('div');
+  prompt.className = 'dice-prompt';
+  prompt.textContent = '点  击  停  止';
+  overlay.appendChild(prompt);
 
-  const tumbleMs = 1200;
+  // Entrance: cube drops in from above with a small overshoot. Spin starts
+  // immediately on the cube; the wrap-level bob waits for entrance to finish
+  // so the two cubeWrap animations don't fight.
+  const ENTER_MS = 360;
+  const enterAnim = cubeWrap.animate(
+    [
+      { transform: 'translateY(-42px) scale(0.45)', opacity: 0.4 },
+      { transform: 'translateY(2px)   scale(1.06)', opacity: 1,   offset: 0.7 },
+      { transform: 'translateY(0px)   scale(1)',    opacity: 1,   offset: 1   },
+    ],
+    { duration: ENTER_MS, easing: 'cubic-bezier(0.34, 1.3, 0.5, 1)', fill: 'forwards' }
+  );
+  cancellers.push(() => { try { enterAnim.cancel(); } catch {} });
 
-  const tumbleAnim = cube.animate(
+  // Tumble. Non-commensurate axis ratios + faster cycle so it whirs instead
+  // of marching. WAAPI (not CSS keyframes) lets us read the animation's
+  // progress at stop time and continue smoothly into the settle anim.
+  const CYCLE = 1800;
+  const rateX = 1.4, rateY = 1.85, rateZ = 0.83;
+  const spinAnim = cube.animate(
     [
       { transform: 'rotateX(0deg) rotateY(0deg) rotateZ(0deg)' },
-      { transform: `rotateX(${tx}deg) rotateY(${ty}deg) rotateZ(${tz}deg)` },
+      { transform: `rotateX(${360 * rateX}deg) rotateY(${360 * rateY}deg) rotateZ(${360 * rateZ}deg)` },
     ],
-    { duration: tumbleMs, easing: 'cubic-bezier(0.16, 0.6, 0.22, 1)', fill: 'forwards' }
+    { duration: CYCLE, iterations: Infinity, easing: 'linear' }
   );
+  cancellers.push(() => { try { spinAnim.cancel(); } catch {} });
 
-  // Subtle shadow pulse — denser at the start (motion blur) → settles steady.
+  // Gentle bob + faint sway — sells the "tossed in palm" feel. Sway period
+  // is intentionally off from bob so the motion never repeats cleanly.
+  const bobAnim = cubeWrap.animate(
+    [
+      { transform: 'translate(0px,  0px)' },
+      { transform: 'translate(1.5px, -6px)', offset: 0.5 },
+      { transform: 'translate(-1px, 0px)',   offset: 1   },
+    ],
+    { duration: 1500, iterations: Infinity, direction: 'alternate', easing: 'ease-in-out', delay: ENTER_MS }
+  );
+  cancellers.push(() => { try { bobAnim.cancel(); } catch {} });
   const shadowAnim = shadow.animate(
     [
-      { transform: 'scale(1.08)', opacity: 0.5 },
-      { transform: 'scale(1)',    opacity: 0.36 },
+      { transform: 'translateX(-50%) scale(1, 1)',    opacity: 0.55 },
+      { transform: 'translateX(-50%) scale(0.74, 1)', opacity: 0.30 },
+      { transform: 'translateX(-50%) scale(1, 1)',    opacity: 0.55 },
     ],
-    { duration: tumbleMs, easing: 'ease-out', fill: 'forwards' }
+    { duration: 1500, iterations: Infinity, easing: 'ease-in-out', delay: ENTER_MS }
   );
+  cancellers.push(() => { try { shadowAnim.cancel(); } catch {} });
 
-  const settle = setTimeout(() => {
-    const pool = FORTUNE_DICE_SAYINGS[n] || [];
-    const saying = pool[Math.floor(Math.random() * pool.length)] || '';
-    revealFortune(resultEl, hintEl, `${n} 点 · ${saying}`);
-  }, tumbleMs);
+  let phase = 'spinning'; // → 'stopping' → 'shown'
+  const startedAt = performance.now();
+  // Wait until entrance settles so a stop never freezes mid-drop-in. Also
+  // shrugs off the trailing mouseup from the menu click that opened us.
+  const INPUT_LOCKOUT_MS = ENTER_MS + 40;
 
-  return () => {
-    clearTimeout(settle);
-    tumbleAnim.cancel();
-    shadowAnim.cancel();
-  };
+  // pickSettle: from `cur` angle, advance to a multiple of 360 plus the face
+  // target offset, with at least one extra full rotation for visual settle.
+  function pickSettle(cur, targetMod) {
+    const t = ((targetMod % 360) + 360) % 360;
+    const curMod = ((cur % 360) + 360) % 360;
+    let delta = t - curMod;
+    if (delta < 0) delta += 360;
+    return cur + delta + 360;
+  }
+
+  function tryStop() {
+    if (phase !== 'spinning') return;
+    if (performance.now() - startedAt < INPUT_LOCKOUT_MS) return;
+    phase = 'stopping';
+
+    const t = (spinAnim.currentTime || 0) % CYCLE;
+    const progress = t / CYCLE;
+    const curX = 360 * rateX * progress;
+    const curY = 360 * rateY * progress;
+    const curZ = 360 * rateZ * progress;
+    try { spinAnim.cancel(); } catch {}
+    try { bobAnim.cancel(); } catch {}
+    try { shadowAnim.cancel(); } catch {}
+
+    const n = 1 + Math.floor(Math.random() * 6);
+    const target = DICE_FACE_TO_ROT[n];
+    const settleX = pickSettle(curX, target.x);
+    const settleY = pickSettle(curY, target.y);
+    const settleZ = pickSettle(curZ, 0);
+
+    const STOP_MS = 780;
+    const stopAnim = cube.animate(
+      [
+        { transform: `rotateX(${curX}deg) rotateY(${curY}deg) rotateZ(${curZ}deg)` },
+        { transform: `rotateX(${settleX}deg) rotateY(${settleY}deg) rotateZ(${settleZ}deg)` },
+      ],
+      { duration: STOP_MS, easing: 'cubic-bezier(0.18, 0.6, 0.22, 1)', fill: 'forwards' }
+    );
+    cancellers.push(() => { try { stopAnim.cancel(); } catch {} });
+
+    // Drop + impact squash + rebound, baked into a single animation on the wrap
+    // so we never have two transforms fighting on the same element.
+    const dropAnim = cubeWrap.animate(
+      [
+        { transform: 'translateY(-5px) scale(1, 1)',       offset: 0    },
+        { transform: 'translateY(0px)  scale(1, 1)',       offset: 0.55 },
+        { transform: 'translateY(2px)  scale(1.12, 0.84)', offset: 0.68 },
+        { transform: 'translateY(0px)  scale(0.96, 1.06)', offset: 0.82 },
+        { transform: 'translateY(0px)  scale(1, 1)',       offset: 1    },
+      ],
+      { duration: STOP_MS, easing: 'cubic-bezier(0.35, 0.05, 0.2, 1)', fill: 'forwards' }
+    );
+    cancellers.push(() => { try { dropAnim.cancel(); } catch {} });
+
+    // Shadow sharpens + darkens as the cube lands.
+    const shadowSettle = shadow.animate(
+      [
+        { transform: 'translateX(-50%) scale(0.78, 1)', opacity: 0.32, filter: 'blur(6px)' },
+        { transform: 'translateX(-50%) scale(1.12, 1)', opacity: 0.62, filter: 'blur(3px)' },
+      ],
+      { duration: STOP_MS, easing: 'cubic-bezier(0.35, 0.05, 0.2, 1)', fill: 'forwards' }
+    );
+    cancellers.push(() => { try { shadowSettle.cancel(); } catch {} });
+
+    prompt.classList.add('hide');
+
+    // Impact: stage rumble + scattered dust right when squash hits its peak.
+    // Squash peaks at offset 0.68 of STOP_MS.
+    const impactDelay = Math.round(STOP_MS * 0.68);
+    const impact = setTimeout(() => {
+      const rumble = stage.animate(
+        [
+          { transform: 'translate(0, 0)' },
+          { transform: 'translate(1.5px, -1px)', offset: 0.18 },
+          { transform: 'translate(-1.5px, 1px)', offset: 0.42 },
+          { transform: 'translate(0.8px, 0)',    offset: 0.66 },
+          { transform: 'translate(-0.6px, 0)',   offset: 0.84 },
+          { transform: 'translate(0, 0)',        offset: 1    },
+        ],
+        { duration: 220, easing: 'linear', fill: 'forwards' }
+      );
+      cancellers.push(() => { try { rumble.cancel(); } catch {} });
+      spawnDust(stage, 8);
+    }, impactDelay);
+    cancellers.push(() => clearTimeout(impact));
+
+    // After settle, lift the cube up so the result card flows in below. The
+    // dice face itself reveals N — no separate numeric badge needed. A small
+    // Z-tilt makes the lift feel like the die is being held up for display.
+    const reveal = setTimeout(() => {
+      const lift = cubeWrap.animate(
+        [
+          { transform: 'translateY(0)     scale(1)    rotate(0deg)' },
+          { transform: 'translateY(-32px) scale(0.68) rotate(-7deg)' },
+        ],
+        { duration: 380, easing: 'cubic-bezier(0.33, 0, 0.4, 1)', fill: 'forwards' }
+      );
+      cancellers.push(() => { try { lift.cancel(); } catch {} });
+
+      const shadowFade = shadow.animate(
+        [
+          { opacity: 0.6 },
+          { opacity: 0.12 },
+        ],
+        { duration: 360, easing: 'ease-out', fill: 'forwards' }
+      );
+      cancellers.push(() => { try { shadowFade.cancel(); } catch {} });
+
+      const card = document.createElement('div');
+      card.className = 'fortune-card dice-card';
+      const pool = FORTUNE_DICE_SAYINGS[n] || [];
+      const saying = pool[Math.floor(Math.random() * pool.length)] || '';
+      card.innerHTML =
+        '<div class="fortune-result"></div>' +
+        '<div class="fortune-hint">再 点 散 场</div>';
+      overlay.appendChild(card);
+
+      const resultEl = card.querySelector('.fortune-result');
+      const hintEl = card.querySelector('.fortune-hint');
+
+      // .dice-card has translateX(-50%) baked in via CSS; keep it in every
+      // keyframe so the animation doesn't drift it off-center.
+      const cardIn = card.animate(
+        [
+          { opacity: 0, transform: 'translate(-50%, 14px)' },
+          { opacity: 1, transform: 'translate(-50%, 0)' },
+        ],
+        { duration: 320, easing: 'cubic-bezier(0.16, 1.0, 0.36, 1)', fill: 'forwards' }
+      );
+      cancellers.push(() => { try { cardIn.cancel(); } catch {} });
+
+      revealFortune(resultEl, hintEl, saying, 'dice');
+      phase = 'shown';
+    }, STOP_MS + 120);
+    cancellers.push(() => clearTimeout(reveal));
+  }
+
+  function onClick() {
+    if (phase === 'spinning') tryStop();
+    else if (phase === 'shown') close();
+  }
+  function onKey(e) {
+    if (e.key === 'Escape') { e.preventDefault(); close(); return; }
+    if (e.key === ' ' || e.key === 'Spacebar' || e.key === 'Enter') {
+      e.preventDefault();
+      if (phase === 'spinning') tryStop();
+      else if (phase === 'shown') close();
+    }
+  }
+
+  overlay.addEventListener('click', onClick);
+  document.addEventListener('keydown', onKey);
+  cancellers.push(() => document.removeEventListener('keydown', onKey));
 }
 
-// 抽签 — bamboo tube shakes, then the chosen fortune stick rises out the top.
-function runLotsDraw(stage, resultEl, hintEl) {
-  const lot = weightedPick(FORTUNE_LOTS);
+// === Lots: 7 sticks spread into a fan, user clicks one to pick. ===
+function stageLotsDraw() {
+  const { overlay, close, cancellers } = buildFortuneOverlay('lots');
 
-  const wrap = document.createElement('div');
-  wrap.className = 'lots-wrap';
-  wrap.innerHTML =
-    '<div class="lots-tube">' +
-      '<div class="lots-tube-rim"></div>' +
-      '<div class="lots-tube-grain"></div>' +
-      '<div class="lots-sticks">' +
-        '<span style="height:22px"></span>' +
-        '<span style="height:30px"></span>' +
-        '<span style="height:26px"></span>' +
-        '<span style="height:32px"></span>' +
-        '<span style="height:24px"></span>' +
-      '</div>' +
-    '</div>' +
-    '<div class="lots-result-stick"><span class="lots-result-text"></span></div>' +
-    '<div class="lots-shadow"></div>';
+  const prompt = document.createElement('div');
+  prompt.className = 'lots-prompt';
+  prompt.textContent = '点  击  摇  签';
+  overlay.appendChild(prompt);
 
-  const tube = wrap.querySelector('.lots-tube');
-  const resultStick = wrap.querySelector('.lots-result-stick');
-  resultStick.querySelector('.lots-result-text').textContent = lot.tier;
-  stage.appendChild(wrap);
+  // Bamboo tube with sticks visible at the top, a wood rim, and a soft shadow.
+  const tubeWrap = document.createElement('div');
+  tubeWrap.className = 'lots-tube-wrap';
 
-  tube.classList.add('lots-shaking');
+  const tube = document.createElement('div');
+  tube.className = 'lots-tube';
 
-  const sayings = lot.sayings || (lot.msg ? [lot.msg] : ['']);
-  const saying = sayings[Math.floor(Math.random() * sayings.length)];
+  const stickRow = document.createElement('div');
+  stickRow.className = 'lots-tube-sticks';
+  // Visible stick tops poking out of the tube — varied heights look hand-loaded.
+  [38, 52, 44, 60, 48, 40, 56].forEach((h) => {
+    const s = document.createElement('span');
+    s.style.height = h + '%';
+    stickRow.appendChild(s);
+  });
+  tube.appendChild(stickRow);
 
-  const settle = setTimeout(() => {
-    tube.classList.remove('lots-shaking');
-    resultStick.classList.add('show');
-    revealFortune(resultEl, hintEl, saying);
-  }, 950);
+  const grain = document.createElement('div');
+  grain.className = 'lots-tube-grain';
+  tube.appendChild(grain);
 
-  return () => { clearTimeout(settle); };
+  const rim = document.createElement('div');
+  rim.className = 'lots-tube-rim';
+  tube.appendChild(rim);
+
+  const tubeShadow = document.createElement('div');
+  tubeShadow.className = 'lots-tube-shadow';
+
+  tubeWrap.appendChild(tube);
+  tubeWrap.appendChild(tubeShadow);
+  overlay.appendChild(tubeWrap);
+
+  let phase = 'waiting'; // → 'shaking' → 'shown'
+
+  function shakeAndDraw() {
+    prompt.classList.add('hide');
+    tube.classList.add('shaking');
+
+    const shakeDur = 720 + Math.floor(Math.random() * 200);
+    const stop = setTimeout(() => {
+      tube.classList.remove('shaking');
+      drawStick();
+    }, shakeDur);
+    cancellers.push(() => clearTimeout(stop));
+  }
+
+  function drawStick() {
+    const lot = weightedPick(FORTUNE_LOTS);
+    const sayings = lot.sayings || [''];
+    const saying = sayings[Math.floor(Math.random() * sayings.length)];
+    const interps = lot.interps || [''];
+    const interp = interps[Math.floor(Math.random() * interps.length)];
+    const number = 1 + Math.floor(Math.random() * 100);
+    const numCh = toChineseNum(number);
+
+    // The chosen stick rises out of the tube into a clear plaque above it.
+    // Tier on top, stick number below — bold horizontal text so they read at
+    // a glance. Final rise offset is small so the plaque stays on-screen.
+    const stick = document.createElement('div');
+    stick.className = 'lots-rising-stick';
+    stick.innerHTML =
+      `<div class="lots-rising-tier">${Array.from(lot.tier).join(' ')}</div>` +
+      '<div class="lots-rising-divider"></div>' +
+      `<div class="lots-rising-num">第 ${numCh} 号</div>`;
+    tubeWrap.appendChild(stick);
+
+    const riseAnim = stick.animate(
+      [
+        { transform: 'translate(-50%, 100%) scale(0.78)', opacity: 0 },
+        { transform: 'translate(-50%, 30%)  scale(0.96)', opacity: 1, offset: 0.45 },
+        { transform: 'translate(-50%, -18%) scale(1.04)', opacity: 1, offset: 0.78 },
+        { transform: 'translate(-50%, -10%) scale(1)',    opacity: 1 },
+      ],
+      { duration: 780, easing: 'cubic-bezier(0.18, 0.78, 0.22, 1.05)', fill: 'forwards' }
+    );
+    cancellers.push(() => { try { riseAnim.cancel(); } catch {} });
+
+    // After the stick reaches its resting spot, slide the tube + plaque left
+    // and surface the saying on an aged paper bookmark on the right side,
+    // plus interp + hint below.
+    const reveal = setTimeout(() => {
+      overlay.classList.add('revealed');
+
+      const scroll = document.createElement('div');
+      scroll.className = 'lots-scroll';
+      scroll.innerHTML =
+        '<div class="lots-scroll-rod lots-scroll-rod-top"></div>' +
+        '<div class="lots-scroll-paper">' +
+          '<div class="fortune-result lots-scroll-text"></div>' +
+        '</div>' +
+        '<div class="lots-scroll-rod lots-scroll-rod-bottom"></div>';
+      overlay.appendChild(scroll);
+
+      const interpEl = document.createElement('div');
+      interpEl.className = 'fortune-result lots-interp-text';
+      const hint = document.createElement('div');
+      hint.className = 'fortune-hint';
+      hint.textContent = '轻 点 散 场';
+      overlay.appendChild(interpEl);
+      overlay.appendChild(hint);
+
+      // Scroll slides up + fades in (resting position is right of viewport center).
+      const scrollIn = scroll.animate(
+        [
+          { opacity: 0, transform: 'translate(calc(-50% + 110px), calc(-50% + 22px)) scale(0.94)' },
+          { opacity: 1, transform: 'translate(calc(-50% + 110px), -50%) scale(1)' },
+        ],
+        { duration: 420, easing: 'cubic-bezier(0.18, 0.78, 0.22, 1.05)', fill: 'forwards' }
+      );
+      cancellers.push(() => { try { scrollIn.cancel(); } catch {} });
+
+      // Brush-write the saying down the paper, then the interp horizontally
+      // below, then surface the dismiss hint.
+      const sayingEl = scroll.querySelector('.lots-scroll-text');
+      const sayStart = setTimeout(() => {
+        sayingEl.classList.add('show');
+        const sayOut = inkWrite(sayingEl, saying, { delayPer: 105, charDur: 280 });
+        cancellers.push(sayOut.cancel);
+
+        const interpStart = setTimeout(() => {
+          interpEl.classList.add('show');
+          const intOut = inkWrite(interpEl, interp, { delayPer: 55, charDur: 220 });
+          cancellers.push(intOut.cancel);
+          const hintShow = setTimeout(() => hint.classList.add('show'), intOut.totalMs + 100);
+          cancellers.push(() => clearTimeout(hintShow));
+        }, sayOut.totalMs + 240);
+        cancellers.push(() => clearTimeout(interpStart));
+      }, 280);
+      cancellers.push(() => clearTimeout(sayStart));
+
+      phase = 'shown';
+    }, 760);
+    cancellers.push(() => clearTimeout(reveal));
+  }
+
+  function onClick() {
+    if (phase === 'waiting') {
+      phase = 'shaking';
+      shakeAndDraw();
+    } else if (phase === 'shown') {
+      close();
+    }
+    // 'shaking' phase ignores clicks
+  }
+
+  overlay.addEventListener('click', onClick);
 }
 
-// Drifting petals on a breeze — petals enter from the left, ride curving paths
-// across the stage, and the saying surfaces as the last petal settles.
-function runSpringSaying(stage, resultEl, hintEl) {
-  const saying =
-    FORTUNE_SAYINGS[Math.floor(Math.random() * FORTUNE_SAYINGS.length)];
+// === Saying: paper messenger flies in, unfolds into a letter, ink writes. ===
+function stageSpringSaying() {
+  const { overlay, close, cancellers } = buildFortuneOverlay('saying');
 
-  const scene = document.createElement('div');
-  scene.className = 'breeze-scene';
-  scene.innerHTML =
-    '<div class="breeze-wisp breeze-wisp-1"></div>' +
-    '<div class="breeze-wisp breeze-wisp-2"></div>' +
-    '<div class="breeze-wisp breeze-wisp-3"></div>';
-  stage.appendChild(scene);
+  const crane = document.createElement('div');
+  crane.className = 'paper-crane';
+  crane.innerHTML =
+    '<div class="paper-crane-wing paper-crane-wing-l"></div>' +
+    '<div class="paper-crane-wing paper-crane-wing-r"></div>' +
+    '<div class="paper-crane-body"></div>';
+  overlay.appendChild(crane);
 
-  const PETAL_GLYPHS = ['❀', '✿', '❁', '✾', '❀', '✿'];
-  const PETAL_COLORS = ['#f7a6c1', '#f48fb1', '#fbc4d3', '#ef9bb6', '#f9c8d6', '#e58fae'];
-  const PETAL_COUNT = 7;
-  const anims = [];
-
-  for (let i = 0; i < PETAL_COUNT; i++) {
+  const PETAL_GLYPHS = ['❀', '✿', '❁', '✾'];
+  const PETAL_COLORS = ['#f7a6c1', '#fbc4d3', '#ef9bb6', '#f9c8d6'];
+  for (let i = 0; i < 4; i++) {
     const p = document.createElement('span');
-    p.className = 'breeze-petal';
+    p.className = 'breeze-petal breeze-petal-overlay';
     p.textContent = PETAL_GLYPHS[i % PETAL_GLYPHS.length];
     p.style.color = PETAL_COLORS[i % PETAL_COLORS.length];
-    p.style.fontSize = `${14 + Math.random() * 12}px`;
-    scene.appendChild(p);
+    p.style.fontSize = `${14 + Math.random() * 10}px`;
+    overlay.appendChild(p);
 
-    const startY = 6 + Math.random() * 84;
-    const drift  = 12 + Math.random() * 26;
-    const dur    = 1900 + Math.random() * 700;
-    const delay  = i * 100 + Math.random() * 90;
-    const spin   = (Math.random() < 0.5 ? -1 : 1) * (320 + Math.random() * 280);
+    const dx = -8 + Math.random() * 16;
+    const dy = -4 + Math.random() * 8;
+    const dur = 2000 + Math.random() * 700;
+    const delay = 220 + i * 140;
+    const spin = (Math.random() < 0.5 ? -1 : 1) * (360 + Math.random() * 240);
 
     const a = p.animate(
       [
-        { transform: `translate(-44px, ${startY}px) rotate(0deg)`,                                opacity: 0 },
-        { transform: `translate(60px,  ${startY - drift}px) rotate(${spin * 0.35}deg)`,           opacity: 1,    offset: 0.32 },
-        { transform: `translate(170px, ${startY + drift * 0.55}px) rotate(${spin * 0.7}deg)`,     opacity: 0.95, offset: 0.68 },
-        { transform: `translate(290px, ${startY - drift * 0.45}px) rotate(${spin}deg)`,           opacity: 0 },
+        { transform: `translate(40vw, -12vh) rotate(0deg)`, opacity: 0 },
+        { transform: `translate(${dx}vw, ${dy}vh) rotate(${spin * 0.5}deg)`, opacity: 0.95, offset: 0.55 },
+        { transform: `translate(${dx - 28}vw, ${dy + 14}vh) rotate(${spin}deg)`, opacity: 0 },
       ],
-      { duration: dur, delay, easing: 'cubic-bezier(0.45, 0.02, 0.55, 0.98)', fill: 'forwards' }
+      { duration: dur, delay, easing: 'cubic-bezier(0.4, 0.06, 0.55, 0.95)', fill: 'forwards' }
     );
-    anims.push(a);
+    cancellers.push(() => { try { a.cancel(); } catch {} });
   }
 
-  resultEl.classList.add('breeze-result');
-  const settle = setTimeout(() => {
-    revealFortune(resultEl, hintEl, saying);
-  }, 1280);
+  // Crane flies in S-curve from off-screen top-right to overlay center.
+  const flyAnim = crane.animate(
+    [
+      { transform: 'translate(-50%, -50%) translate(48vw, -32vh) rotate(38deg) scale(0.65)', opacity: 0 },
+      { transform: 'translate(-50%, -50%) translate(22vw, -6vh)  rotate(18deg) scale(0.88)', opacity: 1, offset: 0.4 },
+      { transform: 'translate(-50%, -50%) translate(-8vw, 8vh)   rotate(-10deg) scale(0.96)', opacity: 1, offset: 0.74 },
+      { transform: 'translate(-50%, -50%) translate(0, 0)         rotate(0deg)  scale(1)',   opacity: 1 },
+    ],
+    { duration: 1400, easing: 'cubic-bezier(0.36, 0.02, 0.4, 1)', fill: 'forwards' }
+  );
+  cancellers.push(() => { try { flyAnim.cancel(); } catch {} });
 
-  return () => {
-    clearTimeout(settle);
-    anims.forEach((a) => a.cancel());
-  };
+  const saying = FORTUNE_SAYINGS[Math.floor(Math.random() * FORTUNE_SAYINGS.length)];
+
+  const unfold = setTimeout(() => {
+    const craneOut = crane.animate(
+      [
+        { opacity: 1, transform: 'translate(-50%, -50%) scale(1) rotate(0deg)' },
+        { opacity: 0, transform: 'translate(-50%, -50%) scale(0.35) rotate(0deg)' },
+      ],
+      { duration: 280, easing: 'ease-in', fill: 'forwards' }
+    );
+    cancellers.push(() => { try { craneOut.cancel(); } catch {} });
+
+    const letter = document.createElement('div');
+    letter.className = 'paper-letter';
+    letter.innerHTML =
+      '<div class="paper-letter-rod paper-letter-rod-l"></div>' +
+      '<div class="paper-letter-rod paper-letter-rod-r"></div>' +
+      '<div class="paper-letter-body">' +
+        '<div class="fortune-result paper-letter-line"></div>' +
+      '</div>' +
+      '<div class="fortune-hint">轻 点 收 起</div>';
+    overlay.appendChild(letter);
+
+    const openAnim = letter.animate(
+      [
+        { clipPath: 'inset(0 50% 0 50%)', opacity: 0 },
+        { clipPath: 'inset(0 0 0 0)',     opacity: 1 },
+      ],
+      { duration: 480, easing: 'cubic-bezier(0.16, 1, 0.36, 1)', fill: 'forwards' }
+    );
+    cancellers.push(() => { try { openAnim.cancel(); } catch {} });
+
+    const lineEl = letter.querySelector('.paper-letter-line');
+    const hintEl = letter.querySelector('.fortune-hint');
+
+    const writeStart = setTimeout(() => {
+      revealFortune(lineEl, hintEl, saying, 'saying');
+    }, 460);
+    cancellers.push(() => clearTimeout(writeStart));
+  }, 1400);
+  cancellers.push(() => clearTimeout(unfold));
+
+  overlay.addEventListener('click', close);
 }
 
 function showToast(message, type = 'info') {
@@ -1341,7 +2089,10 @@ window.MDViewerAPI = {
   setTheme,
   scrollToAnchor,
   setFileTree: (payload) => Sidebar.setFileTree(payload),
+  onScanDirResult: (reqId, payload) => Sidebar.onScanDirResult(reqId, payload),
   toast: (message, type) => showToast(message, type),
   selectAllContent,
   toggleSidebar: () => Sidebar.toggleCollapsed(),
+  setLoading,
+  setRecents: (list) => Sidebar.setRecents(list),
 };

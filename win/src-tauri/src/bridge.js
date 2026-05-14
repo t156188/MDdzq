@@ -93,6 +93,18 @@
         window.MDViewerAPI.setFileTree(p);
       }
     });
+    t.event.listen('mdreader:scan-dir-result', function (e) {
+      var p = (e && e.payload) || null;
+      if (p && window.MDViewerAPI && typeof window.MDViewerAPI.onScanDirResult === 'function') {
+        window.MDViewerAPI.onScanDirResult(p.reqId, p);
+      }
+    });
+    t.event.listen('mdreader:recents', function (e) {
+      var p = (e && e.payload) || [];
+      if (window.MDViewerAPI && typeof window.MDViewerAPI.setRecents === 'function') {
+        window.MDViewerAPI.setRecents(Array.isArray(p) ? p : []);
+      }
+    });
     if (cb) cb();
     return true;
   }

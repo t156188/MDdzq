@@ -28,8 +28,10 @@ struct MarkdownWebView: NSViewRepresentable {
         config.defaultWebpagePreferences.allowsContentJavaScript = true
         config.userContentController.add(context.coordinator, name: "didRender")
         config.userContentController.add(context.coordinator, name: "openFile")
+        config.userContentController.add(context.coordinator, name: "openRecent")
         config.userContentController.add(context.coordinator, name: "fsOp")
         config.userContentController.add(context.coordinator, name: "setThemePref")
+        config.userContentController.add(context.coordinator, name: "scanDir")
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
@@ -157,6 +159,12 @@ struct MarkdownWebView: NSViewRepresentable {
                 name: .mdreaderToggleSidebar,
                 object: nil
             )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleRecentsChanged),
+                name: .mdreaderRecentsChanged,
+                object: nil
+            )
         }
 
         deinit {
@@ -169,6 +177,10 @@ struct MarkdownWebView: NSViewRepresentable {
                 "window.MDViewerAPI && window.MDViewerAPI.toggleSidebar && window.MDViewerAPI.toggleSidebar();",
                 completionHandler: nil
             )
+        }
+
+        @objc func handleRecentsChanged() {
+            pushRecents()
         }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
@@ -203,6 +215,7 @@ struct MarkdownWebView: NSViewRepresentable {
                 pushTree(json: json)
                 pendingTreeJSON = nil
             }
+            pushRecents()
         }
 
         func userContentController(
@@ -216,6 +229,25 @@ struct MarkdownWebView: NSViewRepresentable {
                 let url = URL(fileURLWithPath: path)
                 let cb = onRequestOpen
                 DispatchQueue.main.async { cb(url) }
+            case "openRecent":
+                guard let body = message.body as? [String: Any],
+                      let path = body["path"] as? String else { return }
+                let url = URL(fileURLWithPath: path)
+                // Always treat a recent click as a brand-new document open
+                // (NSDocumentController will surface an existing window if
+                // the same file is already open). If the file is gone, prune
+                // and tell the user via a toast.
+                DispatchQueue.main.async { [weak self] in
+                    if !FileManager.default.fileExists(atPath: path) {
+                        RecentFiles.prune()
+                        self?.toast(message: "That file no longer exists", kind: "error")
+                        return
+                    }
+                    NSDocumentController.shared.openDocument(
+                        withContentsOf: url,
+                        display: true
+                    ) { _, _, _ in }
+                }
             case "fsOp":
                 guard let body = message.body as? [String: Any],
                       let op = body["op"] as? String,
@@ -235,6 +267,17 @@ struct MarkdownWebView: NSViewRepresentable {
                       pref == "system" || pref == "light" || pref == "dark" else { return }
                 let cb = onSetThemePref
                 DispatchQueue.main.async { cb(pref) }
+            case "scanDir":
+                guard let body = message.body as? [String: Any],
+                      let path = body["path"] as? String,
+                      let reqId = body["reqId"] as? String else { return }
+                // Scan off the main thread; large directories can take a beat.
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let json = FileTree.scanChildrenJSON(path: path) ?? "null"
+                    DispatchQueue.main.async {
+                        self?.pushScanResult(reqId: reqId, payloadJSON: json)
+                    }
+                }
             default:
                 break
             }
@@ -293,6 +336,21 @@ struct MarkdownWebView: NSViewRepresentable {
         func pushTree(json: String) {
             guard let webView, isReady else { return }
             let js = "window.MDViewerAPI && window.MDViewerAPI.setFileTree(\(json));"
+            webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+
+        func pushRecents() {
+            guard let webView, isReady else { return }
+            let json = RecentFiles.payloadJSON()
+            let js = "window.MDViewerAPI && window.MDViewerAPI.setRecents && window.MDViewerAPI.setRecents(\(json));"
+            webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+
+        func pushScanResult(reqId: String, payloadJSON: String) {
+            guard let webView, isReady else { return }
+            let js =
+                "window.MDViewerAPI && window.MDViewerAPI.onScanDirResult && "
+                + "window.MDViewerAPI.onScanDirResult(\(encode(reqId)), \(payloadJSON));"
             webView.evaluateJavaScript(js, completionHandler: nil)
         }
 
