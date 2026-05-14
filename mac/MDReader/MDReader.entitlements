@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Sandbox intentionally disabled for v1 so the sidebar can browse the
+      folder of the currently-opened file. If we re-enable sandbox later,
+      switch to security-scoped bookmarks (com.apple.security.files.bookmarks.app-scope).
+    -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+</dict>
+</plist>

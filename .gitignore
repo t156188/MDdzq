@@ -1,0 +1,17 @@
+# Mac build artifacts
+mac/build/
+mac/build-web/node_modules/
+mac/MDReader.xcodeproj/xcuserdata/
+mac/MDReader.xcodeproj/project.xcworkspace/xcuserdata/
+mac/MDReader.xcodeproj/project.xcworkspace/xcshareddata/
+
+# Win / Rust build artifacts
+win/src-tauri/target/
+win/src-tauri/gen/schemas/
+
+# OS / editor
+.DS_Store
+*.log
+
+# Local capture / smoke leftovers
+/tmp-*

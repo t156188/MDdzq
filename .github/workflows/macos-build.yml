@@ -1,0 +1,76 @@
+name: macOS Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mac/**'
+      - '.github/workflows/macos-build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64       # Apple Silicon (M1/M2/M3/M4)
+            suffix: arm64
+          - arch: x86_64      # Intel Macs (pre-2020)
+            suffix: intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Build front-end vendor bundle
+        working-directory: mac/build-web
+        run: |
+          npm install --no-fund --no-audit
+          npm run build
+
+      - name: Generate Xcode project
+        working-directory: mac
+        run: xcodegen generate
+
+      - name: Build .app (${{ matrix.arch }})
+        working-directory: mac
+        run: |
+          xcodebuild \
+            -project MDReader.xcodeproj \
+            -scheme MDReader \
+            -configuration Release \
+            -derivedDataPath build \
+            -arch ${{ matrix.arch }} \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package as DMG
+        working-directory: mac
+        run: |
+          APP="build/Build/Products/Release/MDReader.app"
+          DMG="../MDReader-${{ matrix.suffix }}.dmg"
+          # Stage in a temp folder so the DMG window has a /Applications shortcut.
+          STAGE="$(mktemp -d)/dmg"
+          mkdir -p "$STAGE"
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "MDReader" -srcfolder "$STAGE" \
+            -ov -format UDZO "$DMG"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MDReader-macOS-${{ matrix.suffix }}
+          path: |
+            MDReader-${{ matrix.suffix }}.dmg
+            mac/build/Build/Products/Release/MDReader.app

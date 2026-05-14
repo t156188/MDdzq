@@ -1,0 +1,222 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1f2328;
+  --muted: #59636e;
+  --border: #d1d9e0;
+  --accent: #0969da;
+  --code-bg: #f6f8fa;
+  --quote-fg: #59636e;
+  --quote-border: #d1d9e0;
+  --table-row-alt: #f6f8fa;
+}
+
+[data-theme='dark'] {
+  --bg: #0d1117;
+  --fg: #e6edf3;
+  --muted: #9198a1;
+  --border: #30363d;
+  --accent: #4493f8;
+  --code-bg: #151b23;
+  --quote-fg: #9198a1;
+  --quote-border: #30363d;
+  --table-row-alt: #151b23;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px / 1.6 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', Arial,
+    'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 48px 56px 96px;
+  word-wrap: break-word;
+}
+
+#root:empty::before {
+  content: '';
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin: 24px 0 16px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+h1 {
+  font-size: 2em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+}
+h2 {
+  font-size: 1.5em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+}
+h3 {
+  font-size: 1.25em;
+}
+h4 {
+  font-size: 1em;
+}
+h5 {
+  font-size: 0.875em;
+}
+h6 {
+  font-size: 0.85em;
+  color: var(--muted);
+}
+
+p,
+ul,
+ol,
+dl,
+blockquote,
+pre,
+table {
+  margin: 0 0 16px;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+ul,
+ol {
+  padding-left: 2em;
+}
+
+li + li {
+  margin-top: 0.25em;
+}
+
+li.task-list-item {
+  list-style: none;
+  margin-left: -1.6em;
+}
+li.task-list-item input {
+  margin-right: 0.4em;
+}
+
+blockquote {
+  padding: 0 1em;
+  color: var(--quote-fg);
+  border-left: 0.25em solid var(--quote-border);
+}
+
+hr {
+  height: 0.25em;
+  background: var(--border);
+  border: 0;
+  margin: 24px 0;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono',
+    monospace;
+  font-size: 0.92em;
+}
+
+:not(pre) > code {
+  background: var(--code-bg);
+  padding: 0.2em 0.4em;
+  border-radius: 6px;
+}
+
+pre {
+  position: relative;
+  background: var(--code-bg);
+  padding: 16px;
+  border-radius: 6px;
+  overflow: auto;
+}
+pre > code {
+  background: transparent;
+  padding: 0;
+  display: block;
+}
+
+.code-wrap .copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+pre:hover .copy-btn,
+.copy-btn:focus {
+  opacity: 1;
+}
+
+table {
+  border-collapse: collapse;
+  display: block;
+  overflow-x: auto;
+}
+table th,
+table td {
+  border: 1px solid var(--border);
+  padding: 6px 13px;
+}
+table tr:nth-child(2n) {
+  background: var(--table-row-alt);
+}
+table th {
+  font-weight: 600;
+  background: var(--code-bg);
+}
+
+img {
+  max-width: 100%;
+  border-radius: 4px;
+}
+
+.mermaid {
+  text-align: center;
+  margin: 16px 0;
+}
+.mermaid svg {
+  max-width: 100%;
+  height: auto;
+}
+.mermaid-error {
+  color: #cf222e;
+  background: rgba(207, 34, 46, 0.08);
+  border: 1px solid rgba(207, 34, 46, 0.3);
+}
+
+.katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0;
+}
