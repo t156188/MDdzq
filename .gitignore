@@ -13,5 +13,8 @@ win/src-tauri/gen/schemas/
 .DS_Store
 *.log
 
+# Downloaded CI artifacts
+dist/
+
 # Local capture / smoke leftovers
 /tmp-*
