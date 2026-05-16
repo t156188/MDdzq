@@ -77,9 +77,27 @@ Folders are valid open targets: `Info.plist` declares `public.folder` (rank `Non
 
 Five files must move together: `mac/project.yml` (`MARKETING_VERSION`), `mac/MDReader/Info.plist` (`CFBundleShortVersionString`), `mac/build-web/package.json` + `package-lock.json`, `win/src-tauri/Cargo.toml`, `win/src-tauri/tauri.conf.json`. After editing `Cargo.toml`, run `cargo update -p mdreader --offline` to sync `Cargo.lock`.
 
-**Release-bump rule:** when the user says any variant of "发提交 / 发布 / 发更新 / 发版", bump the patch version (1.0.0 → 1.0.1 → … → 1.0.11) across all five files in the same change, then **ask the user to confirm the new version before committing**. Default to patch-level bumps; only bump minor/major if the user explicitly says so. (Exception: if the current version hasn't shipped yet, don't bump — release as-is.)
+### Release workflow
 
-**Post-release artifact archive:** after the release push, watch the GitHub Actions runs for that commit (`gh run watch` or `gh run list`). When all artifacts complete, download them into `release/v<version>/` (e.g. `release/v1.0.0/`) and `git add` + commit them as a follow-up. Naming: keep CI artifact filenames as-is (`MDGEM-arm64.dmg`, `MDGEM-intel.dmg`, `MDGEM_<version>_x64-setup.exe`). The `release/` directory is intentionally **not** gitignored — it's the version-pinned binary archive.
+Two distinct triggers:
+
+- **"提交" / "提交代码" / "commit"** — stage modified files, draft a commit message, confirm with user, then `git commit` (do **not** push). Adds `Co-Authored-By` per repo convention.
+- **"推送" / "提交推送"** — same as above plus `git push origin main`.
+- **"发版" / "发布" / "发更新" / "出版本"** — full release flow below.
+
+Plain commit / push paths **do not** touch version numbers, tags, or GitHub Releases.
+
+**Full release flow**, with two confirmation gates:
+
+1. Bump the patch version (1.0.0 → 1.0.1 → … → 1.0.11) across the five manifest files (see "Version numbers"). Run `cargo update -p mdreader --offline` to sync `Cargo.lock`. Only bump minor/major when explicitly asked. Exception: if the current version hasn't shipped (no GitHub Release for it), release as-is — don't bump.
+2. **🛑 GATE 1 — version confirmation.** Show the user the new version and wait for confirmation before any commit.
+3. On confirm: commit (`Release X.Y.Z: <subject>`) and `git push origin main`. CI auto-triggers from path filters.
+4. Watch the runs in the background (`gh run watch`). When all artifacts complete, `gh run download` them and flatten into `release/v<version>/` (e.g. `release/v1.0.0/MDGEM-arm64.dmg`). Commit + push as `Archive X.Y.Z release binaries`. Safe step — repo files only, nothing user-visible yet.
+5. Tell the user the three file paths + sizes and ask them to install/test.
+6. **🛑 GATE 2 — publish confirmation.** Wait for explicit "OK / 可以发" before step 7. State-check questions like "是不是…?" are *not* approval.
+7. On confirm: `git tag -a v<version>` + `gh release create v<version> release/v<version>/* --title "MDGEM X.Y.Z" --notes "…"` + `git push origin v<version>`. Tag and Release are always created together — don't tag earlier (a rejected build would leave an orphan tag).
+
+**If GATE 2 is rejected:** version stays bumped (don't roll back). Next release goes to the *next* patch (rejected 1.0.2 → next attempt is 1.0.3). Optionally `git rm -rf release/v<version>/ && git commit` to drop the unpublished binaries — ask the user first.
 
 ## CI
 
